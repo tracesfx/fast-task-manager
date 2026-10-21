@@ -1,17 +1,48 @@
-﻿[package]
+[package]
 name = "fast-task-manager"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, lightweight task manager for Windows"
 
 [dependencies]
-eframe = "0.31"
+# "persistence": settings, dock layout and window size saved between launches.
+eframe = { version = "0.31", features = ["persistence"] }
+# 0.16 is the release built on egui 0.31.
+egui_dock = { version = "0.16", features = ["serde"] }
 egui_extras = "0.31"
-# Only the process/CPU/memory module; no rayon thread pool ("multithread"),
-# no disks/networks/components/users.
-sysinfo = { version = "0.34", default-features = false, features = ["system"] }
-# Process actions: end process, set priority. Already in the dependency tree via winit.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# 0.32 is the release built on egui 0.31.
+egui_plot = "0.32"
+serde = { version = "1", features = ["derive"] }
+# The previous process backend, only for comparing against (feature "sysinfo").
+# Only the process/CPU/memory module; no rayon thread pool ("multithread").
+sysinfo = { version = "0.34", default-features = false, features = ["system"], optional = true }
+# Process data (NtQuerySystemInformation) and process actions (end process,
+# set priority). Already in the dependency tree via winit.
+windows-sys = { version = "0.59", features = [
+    "Wdk_System_SystemInformation",
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    # Global show/hide hotkey.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The main window's HWND for the hotkey; same version eframe uses.
+raw-window-handle = "0.6"
+# Profiling only (feature "puffin"). puffin 0.20 is what profiling 1.0.18 uses.
+puffin = { version = "0.20", optional = true }
+puffin_http = { version = "0.17", optional = true }
+# Not used directly: its puffin backend turns on egui's and eframe's own scopes.
+profiling = { version = "1", optional = true, default-features = false, features = ["profile-with-puffin"] }
+
+[features]
+# `cargo run --release --features puffin`, then connect `puffin_viewer` to
+# 127.0.0.1:8585. See src/profiler.rs for the headless summary log.
+puffin = ["dep:puffin", "dep:puffin_http", "dep:profiling"]
+# The sysinfo backend: `FTM_SOURCE=sysinfo` selects it, and the tests in
+# src/source compare and benchmark it against the NT backend.
+sysinfo = ["dep:sysinfo"]
 
 [profile.release]
 opt-level = 3

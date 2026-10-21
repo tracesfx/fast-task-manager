@@ -1,11 +1,14 @@
-use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use super::{ProcessSource, RawProcess, RawSample};
 
-/// `ProcessSource` backed by the `sysinfo` crate.
+/// `ProcessSource` backed by the `sysinfo` crate: a Toolhelp snapshot, then
+/// several calls per process through a handle it keeps open. Processes it
+/// can't open report no CPU time, memory or start time. Replaced by
+/// `NtSource`; kept (feature `sysinfo`) to compare against.
 pub struct SysinfoSource {
     sys: System,
     refresh_kind: ProcessRefreshKind,
@@ -41,8 +44,8 @@ impl ProcessSource for SysinfoSource {
             RawProcess {
                 pid: p.pid().as_u32(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
-                name: p.name().to_string_lossy().into_owned(),
-                exe: p.exe().map(Path::to_path_buf),
+                name: p.name().to_string_lossy().into(),
+                exe: p.exe().map(Arc::from),
                 cpu_time: Duration::from_millis(p.accumulated_cpu_time()),
                 working_set: p.memory(),
                 // On Windows sysinfo fills this with the private byte count

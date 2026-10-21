@@ -11,6 +11,9 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use crate::format;
 use crate::model::{ProcessInfo, Snapshot};
@@ -35,11 +38,11 @@ impl ProcKey {
 /// Stable identity of a table row.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
-    Group(String),
+    Group(Arc<str>),
     Proc(ProcKey),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewMode {
     /// Processes grouped by executable.
     Apps,
@@ -49,7 +52,7 @@ pub enum ViewMode {
     Processes,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortColumn {
     Pid,
     ParentPid,
@@ -94,7 +97,7 @@ impl SortColumn {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sort {
     pub column: SortColumn,
     pub descending: bool,
@@ -144,7 +147,7 @@ impl<'a> Metrics<'a> {
 
 /// Processes sharing one executable.
 pub struct Group {
-    pub key: String,
+    pub key: Arc<str>,
     /// Indices into `Snapshot::processes`, sorted. Only filter matches.
     pub members: Vec<usize>,
     min_pid: u32,
@@ -158,7 +161,7 @@ pub struct Group {
 }
 
 impl Group {
-    fn new(key: String) -> Self {
+    fn new(key: Arc<str>) -> Self {
         Self {
             key,
             members: Vec::new(),
@@ -233,13 +236,13 @@ pub struct View {
 impl View {
     pub fn row_id(&self, row: &Row, procs: &[ProcessInfo]) -> RowId {
         match row.kind {
-            RowKind::Group(g) => RowId::Group(self.groups[g].key.clone()),
+            RowKind::Group(g) => RowId::Group(Arc::clone(&self.groups[g].key)),
             RowKind::Process(i) => RowId::Proc(ProcKey::of(&procs[i])),
         }
     }
 
     pub fn find_group(&self, key: &str) -> Option<&Group> {
-        self.groups.iter().find(|g| g.key == key)
+        self.groups.iter().find(|g| &*g.key == key)
     }
 
     /// `root` followed by all its descendants (tree mode), parents first.
@@ -263,7 +266,7 @@ impl View {
 /// Display order from the previous build, used to break ties.
 #[derive(Default)]
 struct Ranks {
-    groups: HashMap<String, u32>,
+    groups: HashMap<Arc<str>, u32>,
     procs: HashMap<ProcKey, u32>,
 }
 
@@ -298,8 +301,8 @@ impl<'a> RankBuilder<'a> {
         self.next += 1;
     }
 
-    fn record_group(&mut self, key: &str) {
-        self.new.groups.insert(key.to_owned(), self.next);
+    fn record_group(&mut self, key: &Arc<str>) {
+        self.new.groups.insert(Arc::clone(key), self.next);
         self.next += 1;
     }
 
@@ -319,7 +322,7 @@ pub struct ViewState {
     pub sort: Sort,
     pub filter: String,
     /// Apps mode: groups are collapsed unless listed here.
-    pub expanded_groups: HashSet<String>,
+    pub expanded_groups: HashSet<Arc<str>>,
     /// Tree mode: nodes are expanded unless listed here.
     pub collapsed_procs: HashSet<ProcKey>,
     ranks: Ranks,
@@ -346,7 +349,7 @@ impl ViewState {
         match id {
             RowId::Group(key) => {
                 if !self.expanded_groups.remove(key) {
-                    self.expanded_groups.insert(key.clone());
+                    self.expanded_groups.insert(Arc::clone(key));
                 }
             }
             RowId::Proc(key) => {
@@ -399,14 +402,14 @@ impl ViewState {
 
 /// Groups the matching processes by executable, in first-seen order.
 fn group_apps(procs: &[ProcessInfo], matches: &[bool]) -> Vec<Group> {
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
     let mut groups: Vec<Group> = Vec::new();
     for (i, p) in procs.iter().enumerate() {
         if !matches[i] {
             continue;
         }
-        let g = *index.entry(group_key(p)).or_insert_with_key(|key| {
-            groups.push(Group::new(key.clone()));
+        let g = *index.entry(&p.group_key).or_insert_with(|| {
+            groups.push(Group::new(Arc::clone(&p.group_key)));
             groups.len() - 1
         });
         groups[g].add(i, p);
@@ -418,7 +421,7 @@ fn build_apps(
     procs: &[ProcessInfo],
     matches: &[bool],
     sort: Sort,
-    expanded: &HashSet<String>,
+    expanded: &HashSet<Arc<str>>,
     ranks: &mut RankBuilder,
 ) -> View {
     let mut groups = group_apps(procs, matches);
@@ -619,11 +622,12 @@ impl TreeEmitter<'_> {
 }
 
 /// Executables are grouped by full path; processes whose path can't be read
-/// (protected system processes) fall back to grouping by name.
-pub fn group_key(p: &ProcessInfo) -> String {
-    match &p.exe {
+/// (protected system processes) fall back to grouping by name. Computed
+/// once per process by the sampler (`ProcessInfo::group_key`).
+pub fn group_key(name: &str, exe: Option<&Path>) -> String {
+    match exe {
         Some(exe) if !exe.as_os_str().is_empty() => exe.to_string_lossy().to_lowercase(),
-        _ => format!("name:{}", p.name.to_lowercase()),
+        _ => format!("name:{}", name.to_lowercase()),
     }
 }
 
@@ -672,11 +676,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn proc(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, start: u64) -> ProcessInfo {
+        let exe = PathBuf::from(format!(r"C:\Apps\{name}"));
         ProcessInfo {
             pid,
             parent_pid: ppid,
-            name: name.to_owned(),
-            exe: Some(PathBuf::from(format!(r"C:\Apps\{name}"))),
+            group_key: group_key(name, Some(&exe)).into(),
+            name: name.into(),
+            exe: Some(exe.into()),
             cpu_percent: cpu,
             working_set: 0,
             private_bytes: 0,
@@ -719,7 +725,7 @@ mod tests {
         assert!((chrome.metrics(&s.processes).cpu_percent - 3.0).abs() < 1e-6);
         assert_eq!(view.rows[0].expander, Some(false));
 
-        state.toggle(&RowId::Group(chrome.key.clone()));
+        state.toggle(&RowId::Group(Arc::clone(&chrome.key)));
         assert_eq!(state.build(&s).rows.len(), 4);
     }
 

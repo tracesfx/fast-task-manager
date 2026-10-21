@@ -54,7 +54,7 @@ impl ProcTarget {
         Self {
             pid: p.pid,
             start_time: p.start_time,
-            name: p.name.clone(),
+            name: p.name.to_string(),
         }
     }
 }

@@ -1,42 +1,84 @@
-//! The UI: system totals and view controls on top, then the treemap, the
-//! process table below, toasts in the bottom-right corner.
+//! The UI: a menu bar and the system totals (with history graphs) on top,
+//! then a dock of panes (see `layout::Pane`) the user can rearrange, toasts
+//! in the bottom-right corner. Settings and the dock layout are saved
+//! between launches.
 //!
 //! The UI never polls. It repaints only when egui receives input, when the
 //! sampler publishes a new snapshot, when an action finishes, when a toast
 //! is due to expire, or while a treemap transition is running.
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui_dock::{DockArea, DockState, TabViewer};
 use egui_extras::{Column, TableBuilder, TableRow};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use serde::{Deserialize, Serialize};
 
 use crate::actions::{self, Outcome, Priority, ProcTarget, Request};
 use crate::format;
+use crate::graphs;
+use crate::history::History;
+use crate::hotkey::{self, Hotkey};
+use crate::layout::{self, Pane, Preset};
 use crate::model::Snapshot;
 use crate::sampler::SamplerHandle;
-use crate::source::SysinfoSource;
-use crate::treemap::Treemap;
-use crate::view::{self, Metrics, ProcKey, Row, RowId, RowKind, Sort, SortColumn, View, ViewMode, ViewState};
+use crate::settings::{self, Appearance, Settings, TableColumn};
+use crate::source::NtSource;
+use crate::treemap::{Metric, Treemap};
+use crate::view::{Metrics, ProcKey, Row, RowId, RowKind, Sort, SortColumn, View, ViewMode, ViewState};
 
-const INTERVALS_MS: [u64; 5] = [250, 500, 1000, 2000, 5000];
 const INDENT: f32 = 16.0;
+const SPARKLINE_WIDTH: f32 = 90.0;
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(8);
+const DEFAULT_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+const COMPACT_SIZE: egui::Vec2 = egui::vec2(320.0, 300.0);
 
-const COLUMNS: [(SortColumn, &str); 10] = [
-    (SortColumn::Name, "Name"),
-    (SortColumn::Pid, "PID"),
-    (SortColumn::ParentPid, "PPID"),
-    (SortColumn::Cpu, "CPU %"),
-    (SortColumn::WorkingSet, "Working set"),
-    (SortColumn::Private, "Private"),
-    (SortColumn::DiskRead, "Disk read"),
-    (SortColumn::DiskWrite, "Disk write"),
-    (SortColumn::Started, "Running for"),
-    (SortColumn::Path, "Path"),
-];
+/// Storage key of the dock layout. It is saved apart from `Persisted` so a
+/// layout that no longer loads (say, after an egui_dock update) only
+/// resets the layout, not the settings.
+const DOCK_KEY: &str = "dock";
+
+/// Settings saved between launches (eframe storage, under `APP_KEY`).
+/// Fields missing from an older save take their defaults; an unreadable
+/// save is ignored.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Persisted {
+    settings: Settings,
+    mode: ViewMode,
+    sort: Sort,
+    /// Window size to return to when leaving the compact layout; set while
+    /// it is active.
+    compact_restore: Option<[f32; 2]>,
+}
+
+impl Default for Persisted {
+    fn default() -> Self {
+        let state = ViewState::default();
+        Self {
+            settings: Settings::default(),
+            mode: state.mode,
+            sort: state.sort,
+            compact_restore: None,
+        }
+    }
+}
+
+/// Settings as last pushed to egui, the sampler, the window and the
+/// treemap; `None` until the first frame applies them.
+#[derive(Default)]
+struct Applied {
+    interval_ms: Option<u64>,
+    appearance: Option<Appearance>,
+    zoom: Option<f32>,
+    on_top: Option<bool>,
+    treemap: Option<(Metric, Metric)>,
+    gradient: Option<Vec<[u8; 3]>>,
+}
 
 /// Something the user did this frame, applied after the table is drawn.
 enum UiAction {
@@ -45,6 +87,9 @@ enum UiAction {
     Select(RowId),
     /// Selected in the treemap: also scroll the table to it.
     Reveal(RowId),
+    /// Open the detail panel for this app group.
+    Details(Arc<str>),
+    CloseDetails,
     Run(Request),
 }
 
@@ -57,6 +102,7 @@ struct Toast {
 pub struct TaskManagerApp {
     sampler: SamplerHandle,
     snapshot: Arc<Snapshot>,
+    history: Arc<Mutex<History>>,
     state: ViewState,
     view: View,
     /// Snapshot seq the view was built from.
@@ -66,8 +112,16 @@ pub struct TaskManagerApp {
     /// Scroll the table to the selection on the next frame.
     scroll_to_selected: bool,
     treemap: Treemap,
-    show_treemap: bool,
-    interval_ms: u64,
+    /// Group key of the app shown in the detail pane.
+    detail: Option<Arc<str>>,
+    dock: DockState<Pane>,
+    settings: Settings,
+    applied: Applied,
+    show_settings: bool,
+    compact_restore: Option<[f32; 2]>,
+    /// The main window, for the hotkey.
+    hwnd: Option<isize>,
+    hotkey: Option<Hotkey>,
     toasts: Vec<Toast>,
     outcome_tx: Sender<Outcome>,
     outcome_rx: Receiver<Outcome>,
@@ -76,27 +130,49 @@ pub struct TaskManagerApp {
 
 impl TaskManagerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let interval_ms = 1000;
+        let saved: Persisted = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
+            .unwrap_or_default();
+        let mut settings = saved.settings;
+        settings.normalize();
+        let dock = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, DOCK_KEY))
+            .unwrap_or_else(|| Preset::Default.dock());
+
         let ctx = cc.egui_ctx.clone();
-        let repaint_ctx = ctx.clone();
-        let sampler = SamplerHandle::spawn(
-            SysinfoSource::new(),
-            Duration::from_millis(interval_ms),
-            move || repaint_ctx.request_repaint(),
-        );
+        let sampler = spawn_sampler(Duration::from_millis(settings.interval_ms), ctx.clone());
         let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut state = ViewState::default();
+        state.mode = saved.mode;
+        state.sort = saved.sort;
+        let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
+            _ => None,
+        };
         Self {
             snapshot: sampler.latest(),
+            history: sampler.history(),
             sampler,
-            state: ViewState::default(),
+            state,
             view: View::default(),
             view_seq: u64::MAX,
             view_dirty: true,
             selected: None,
             scroll_to_selected: false,
             treemap: Treemap::default(),
-            show_treemap: true,
-            interval_ms,
+            detail: None,
+            dock,
+            applied: Applied {
+                interval_ms: Some(settings.interval_ms),
+                ..Applied::default()
+            },
+            settings,
+            show_settings: false,
+            compact_restore: saved.compact_restore,
+            hwnd,
+            hotkey: None,
             toasts: Vec::new(),
             outcome_tx,
             outcome_rx,
@@ -114,6 +190,15 @@ impl TaskManagerApp {
             }
             refresher.refresh_now();
             ctx.request_repaint();
+        });
+    }
+
+    fn toast(&mut self, message: String, is_error: bool) {
+        let lifetime = if is_error { TOAST_ERROR } else { TOAST_INFO };
+        self.toasts.push(Toast {
+            message,
+            is_error,
+            expires: Instant::now() + lifetime,
         });
     }
 
@@ -136,15 +221,138 @@ impl TaskManagerApp {
                 self.selected = Some(id);
                 self.view_dirty = true;
             }
-            UiAction::Select(id) => self.selected = Some(id),
+            // Clicking an app (not one of its processes) shows its details,
+            // if the details pane is open.
+            UiAction::Select(id) => {
+                self.show_details_of(&id);
+                self.selected = Some(id);
+            }
             UiAction::Reveal(id) => {
+                self.show_details_of(&id);
                 self.selected = Some(id);
                 self.scroll_to_selected = true;
             }
+            UiAction::Details(key) => {
+                self.detail = Some(key);
+                layout::open(&mut self.dock, Pane::Details);
+            }
+            UiAction::CloseDetails => self.detail = None,
             UiAction::Run(request) => self.run(request),
         }
         // Show the result now rather than on the next snapshot.
         self.ctx.request_repaint();
+    }
+
+    fn show_details_of(&mut self, id: &RowId) {
+        if let RowId::Group(key) = id {
+            self.detail = Some(key.clone());
+            layout::focus(&mut self.dock, Pane::Details);
+        }
+    }
+
+    /// Rebuilds the view and the treemap's groups if the snapshot or the
+    /// view settings changed.
+    fn refresh_view(&mut self) {
+        if self.view_dirty || self.view_seq != self.snapshot.seq {
+            profile_scope!("view rebuild");
+            self.view = self.state.build(&self.snapshot);
+            // Always, so the treemap's process indices match the snapshot.
+            self.treemap.set_groups(self.state.app_groups(&self.snapshot));
+            self.view_seq = self.snapshot.seq;
+            self.view_dirty = false;
+        }
+    }
+
+    /// Switches to `preset`'s dock layout. The compact one also shrinks the
+    /// window and keeps it on top; leaving it restores the window size.
+    fn apply_preset(&mut self, preset: Preset, ctx: &egui::Context) {
+        self.dock = preset.dock();
+        let compact = preset == Preset::Compact;
+        if compact && self.compact_restore.is_none() {
+            let size = ctx
+                .input(|i| i.viewport().inner_rect)
+                .map_or(DEFAULT_SIZE, |r| r.size());
+            self.compact_restore = Some(size.into());
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(COMPACT_SIZE));
+        } else if !compact {
+            if let Some(size) = self.compact_restore.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
+            }
+        }
+        self.settings.totals_bar = !compact;
+        self.settings.always_on_top = compact;
+    }
+
+    /// Pushes settings that changed since the last call to egui, the
+    /// sampler, the window, the treemap and the hotkey. Returns whether
+    /// anything was applied that needs another frame to show.
+    fn apply_settings(&mut self, ctx: &egui::Context) -> bool {
+        let s = &mut self.settings;
+        let a = &mut self.applied;
+        let mut changed = false;
+
+        if a.interval_ms != Some(s.interval_ms) {
+            self.sampler.set_interval(Duration::from_millis(s.interval_ms));
+            a.interval_ms = Some(s.interval_ms);
+        }
+        if a.appearance.as_ref() != Some(&s.appearance) {
+            s.appearance.apply(ctx);
+            a.appearance = Some(s.appearance.clone());
+            changed = true;
+        }
+        // A changed setting wins; otherwise pick up Ctrl +/- zooming, which
+        // takes effect at the start of the next frame.
+        let zoom = ctx.zoom_factor();
+        if a.zoom != Some(s.ui_scale) {
+            ctx.set_zoom_factor(s.ui_scale);
+            a.zoom = Some(s.ui_scale);
+            changed = true;
+        } else if zoom != s.ui_scale {
+            s.ui_scale = zoom;
+            a.zoom = Some(zoom);
+        }
+        if a.on_top != Some(s.always_on_top) {
+            let level = if s.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            a.on_top = Some(s.always_on_top);
+        }
+        // Defaults: applied at startup and when edited in Settings; the
+        // treemap's own controls change only the current view.
+        let metrics = (s.treemap_size, s.treemap_color);
+        if a.treemap != Some(metrics) {
+            self.treemap.set_metrics(metrics.0, metrics.1);
+            a.treemap = Some(metrics);
+            changed = true;
+        }
+        if a.gradient.as_ref() != Some(&s.gradient) {
+            self.treemap.set_gradient(&s.gradient);
+            a.gradient = Some(s.gradient.clone());
+            changed = true;
+        }
+
+        if s.hotkey != self.hotkey.is_some() {
+            if s.hotkey {
+                let result = self
+                    .hwnd
+                    .ok_or_else(|| "No window handle for the global hotkey".to_owned())
+                    .and_then(Hotkey::register);
+                match result {
+                    Ok(hotkey) => self.hotkey = Some(hotkey),
+                    Err(message) => {
+                        s.hotkey = false;
+                        self.toast(message, true);
+                        changed = true;
+                    }
+                }
+            } else {
+                self.hotkey = None;
+            }
+        }
+        changed
     }
 
     /// Processes the selected row stands for, for the Delete key.
@@ -156,7 +364,7 @@ impl TaskManagerApp {
                 // Picked in the treemap while the table isn't in Apps mode.
                 None => procs
                     .iter()
-                    .filter(|p| view::group_key(p) == *key)
+                    .filter(|p| p.group_key == *key)
                     .map(ProcTarget::of)
                     .collect(),
             },
@@ -182,7 +390,7 @@ impl TaskManagerApp {
         let procs = &self.snapshot.processes;
         match (selected, row.kind) {
             (RowId::Group(key), RowKind::Process(i)) => {
-                self.state.mode != ViewMode::Apps && view::group_key(&procs[i]) == *key
+                self.state.mode != ViewMode::Apps && procs[i].group_key == *key
             }
             (RowId::Proc(key), RowKind::Group(g)) => {
                 row.expander != Some(true)
@@ -200,24 +408,12 @@ impl TaskManagerApp {
             .position(|row| self.row_selected(row, &self.view.row_id(row, procs)))
     }
 
-    fn totals_panel(&mut self, ui: &mut egui::Ui) {
+    fn totals_panel(&mut self, ui: &mut egui::Ui, history: &History) {
         let snap = &self.snapshot;
         let sys = &snap.system;
 
         ui.horizontal(|ui| {
-            ui.strong(format!("CPU {:.1}%", sys.cpu_percent));
-            ui.separator();
-            let mem_frac = if sys.total_memory > 0 {
-                sys.used_memory as f32 / sys.total_memory as f32
-            } else {
-                0.0
-            };
-            ui.strong(format!(
-                "RAM {} / {} ({:.0}%)",
-                format::bytes(sys.used_memory),
-                format::bytes(sys.total_memory),
-                mem_frac * 100.0
-            ));
+            graphs::totals(ui, history, sys.total_memory);
             ui.separator();
             ui.label(format!("{} processes", snap.processes.len()));
             ui.separator();
@@ -227,32 +423,91 @@ impl TaskManagerApp {
             ));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let before = self.interval_ms;
-                egui::ComboBox::from_id_salt("interval")
-                    .selected_text(interval_label(self.interval_ms))
-                    .show_ui(ui, |ui| {
-                        for ms in INTERVALS_MS {
-                            ui.selectable_value(&mut self.interval_ms, ms, interval_label(ms));
-                        }
-                    });
+                settings::interval_combo(ui, "interval", &mut self.settings.interval_ms);
                 ui.label("Refresh:");
-                if self.interval_ms != before {
-                    self.sampler
-                        .set_interval(Duration::from_millis(self.interval_ms));
-                }
             });
         });
+    }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (i, pct) in sys.per_core_percent.iter().enumerate() {
-                ui.add(
-                    egui::ProgressBar::new(pct / 100.0)
-                        .desired_width(70.0)
-                        .text(format!("{i}: {pct:.0}%")),
-                );
+    /// The menu bar. Returns a layout preset the user picked.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) -> Option<Preset> {
+        let mut preset = None;
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("View", |ui| {
+                for pane in Pane::ALL {
+                    let mut open = self.dock.find_tab(&pane).is_some();
+                    if ui.checkbox(&mut open, pane.title()).changed() {
+                        if open {
+                            layout::open(&mut self.dock, pane);
+                        } else {
+                            layout::close(&mut self.dock, pane);
+                        }
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.settings.totals_bar, "Totals bar");
+                ui.checkbox(&mut self.settings.always_on_top, "Always on top");
+                if let (Some(_), Some(hwnd)) = (&self.hotkey, self.hwnd) {
+                    ui.separator();
+                    if ui.button(format!("Hide window ({})", hotkey::LABEL)).clicked() {
+                        ui.close_menu();
+                        hotkey::hide(hwnd);
+                    }
+                }
+            });
+            ui.menu_button("Layout", |ui| {
+                for p in Preset::ALL {
+                    if ui.button(p.label()).on_hover_text(p.description()).clicked() {
+                        preset = Some(p);
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("Reset layout").clicked() {
+                    preset = Some(Preset::Default);
+                    ui.close_menu();
+                }
+            });
+            if ui.button("Settings…").clicked() {
+                self.show_settings = !self.show_settings;
             }
         });
+        preset
+    }
+
+    /// Totals and the busiest apps, for the compact layout.
+    fn mini_view(&self, ui: &mut egui::Ui, history: &History) {
+        let sys = &self.snapshot.system;
+        ui.add(egui::ProgressBar::new(sys.cpu_percent / 100.0).text(format!("CPU {:.1}%", sys.cpu_percent)));
+        ui.add(
+            egui::ProgressBar::new(sys.used_memory as f32 / sys.total_memory.max(1) as f32).text(format!(
+                "RAM {} / {}",
+                format::bytes(sys.used_memory),
+                format::bytes(sys.total_memory)
+            )),
+        );
+        let Some(last) = history.system().back() else {
+            return;
+        };
+        ui.label(format!(
+            "Disk R {} · W {}",
+            format::rate(last.disk_read_per_sec),
+            format::rate(last.disk_write_per_sec)
+        ));
+        ui.separator();
+        if last.top.is_empty() {
+            ui.weak("No app is using CPU");
+            return;
+        }
+        ui.strong("Top apps by CPU");
+        // Bars are relative to the busiest app; the text has the values.
+        let busiest = last.top.iter().map(|a| a.cpu_percent).fold(0.0, f32::max);
+        for app in &last.top {
+            ui.add(
+                egui::ProgressBar::new(app.cpu_percent / busiest.max(0.1))
+                    .text(format!("{}  {}%", app.name, format::cpu(app.cpu_percent))),
+            );
+        }
     }
 
     fn view_controls(&mut self, ui: &mut egui::Ui) {
@@ -296,42 +551,53 @@ impl TaskManagerApp {
                 self.state.filter.clear();
                 self.view_dirty = true;
             }
-            ui.separator();
-            ui.toggle_value(&mut self.show_treemap, "Treemap");
         });
     }
 
-    fn process_table(&self, ui: &mut egui::Ui, scroll_to: Option<usize>) -> Option<UiAction> {
+    fn process_table(&self, ui: &mut egui::Ui, scroll_to: Option<usize>, history: &History) -> Option<UiAction> {
+        profile_scope!("table");
         let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
         let mut action = None;
         let sort = self.state.sort;
+        // Only app rows have a CPU history. On the stack: drawn every frame.
+        let mut column_buf = [TableColumn::Name; TableColumn::ALL.len()];
+        let mut count = 0;
+        for c in self.settings.visible_columns() {
+            if c != TableColumn::CpuHistory || self.state.mode == ViewMode::Apps {
+                column_buf[count] = c;
+                count += 1;
+            }
+        }
+        let columns = &column_buf[..count];
 
-        let mut builder = TableBuilder::new(ui);
+        // Column widths are remembered per column set.
+        let mut builder = TableBuilder::new(ui).id_salt(("table", columns));
         if let Some(row) = scroll_to {
             builder = builder.scroll_to_row(row, Some(egui::Align::Center));
         }
-        builder
+        builder = builder
             .striped(true)
             .resizable(true)
             .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(260.0).at_least(80.0).clip(true))
-            .column(Column::initial(60.0).at_least(40.0))
-            .column(Column::initial(60.0).at_least(40.0))
-            .column(Column::initial(60.0).at_least(40.0))
-            .columns(Column::initial(90.0).at_least(50.0), 4)
-            .column(Column::initial(90.0).at_least(50.0))
-            .column(Column::remainder().at_least(80.0).clip(true))
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        for (i, &c) in columns.iter().enumerate() {
+            builder = builder.column(column_spec(c, i + 1 == columns.len()));
+        }
+        builder
             .header(row_height + 2.0, |mut header| {
-                for (column, label) in COLUMNS {
+                for &c in columns {
                     header.col(|ui| {
+                        let Some(column) = c.sort() else {
+                            ui.strong(c.label());
+                            return;
+                        };
                         let arrow = match (sort.column == column, sort.descending) {
                             (true, true) => " ⏷",
                             (true, false) => " ⏶",
                             _ => "",
                         };
                         let button = egui::Button::new(
-                            egui::RichText::new(format!("{label}{arrow}")).strong(),
+                            egui::RichText::new(format!("{}{arrow}", c.label())).strong(),
                         )
                         .frame(false);
                         if ui.add(button).clicked() {
@@ -341,16 +607,25 @@ impl TaskManagerApp {
                 }
             })
             .body(|body| {
+                // Virtualized: only the rows in view are laid out.
                 body.rows(row_height, self.view.rows.len(), |mut table_row| {
                     let row = self.view.rows[table_row.index()];
-                    self.table_row(&mut table_row, &row, &mut action);
+                    self.table_row(&mut table_row, &row, columns, history, &mut action);
                 });
             });
 
         action
     }
 
-    fn table_row(&self, table_row: &mut TableRow, row: &Row, action: &mut Option<UiAction>) {
+    fn table_row(
+        &self,
+        table_row: &mut TableRow,
+        row: &Row,
+        columns: &[TableColumn],
+        history: &History,
+        action: &mut Option<UiAction>,
+    ) {
+        profile_scope!("table row");
         let procs = &self.snapshot.processes;
         let id = self.view.row_id(row, procs);
         table_row.set_selected(self.row_selected(row, &id));
@@ -369,56 +644,68 @@ impl TaskManagerApp {
         };
         let is_aggregate = count > 1;
 
-        table_row.col(|ui| {
-            ui.add_space(f32::from(row.depth) * INDENT);
-            match row.expander {
-                Some(expanded) => {
-                    let icon = if expanded { "⏷" } else { "⏵" };
-                    if ui.add(egui::Button::new(icon).frame(false)).clicked() {
-                        *action = Some(UiAction::Toggle(id.clone()));
+        for &column in columns {
+            table_row.col(|ui| match column {
+                TableColumn::Name => {
+                    ui.add_space(f32::from(row.depth) * INDENT);
+                    match row.expander {
+                        Some(expanded) => {
+                            let icon = if expanded { "⏷" } else { "⏵" };
+                            if ui.add(egui::Button::new(icon).frame(false)).clicked() {
+                                *action = Some(UiAction::Toggle(id.clone()));
+                            }
+                        }
+                        None => ui.add_space(INDENT),
+                    }
+                    let label = if is_aggregate {
+                        format!("{} ({count})", m.name)
+                    } else {
+                        m.name.to_owned()
+                    };
+                    let mut text = egui::RichText::new(label);
+                    if row.context_only {
+                        text = text.weak();
+                    }
+                    ui.label(text);
+                }
+                TableColumn::Pid => {
+                    if !is_aggregate {
+                        right(ui, m.pid.to_string());
                     }
                 }
-                None => ui.add_space(INDENT),
-            }
-            let label = if is_aggregate {
-                format!("{} ({count})", m.name)
-            } else {
-                m.name.to_owned()
-            };
-            let mut text = egui::RichText::new(label);
-            if row.context_only {
-                text = text.weak();
-            }
-            ui.label(text);
-        });
-        table_row.col(|ui| {
-            if !is_aggregate {
-                right(ui, m.pid.to_string());
-            }
-        });
-        table_row.col(|ui| {
-            if let (false, Some(ppid)) = (is_aggregate, m.parent_pid) {
-                right(ui, ppid.to_string());
-            }
-        });
-        table_row.col(|ui| right(ui, format::cpu(m.cpu_percent)));
-        table_row.col(|ui| right(ui, format::mem(m.working_set)));
-        table_row.col(|ui| right(ui, format::mem(m.private_bytes)));
-        table_row.col(|ui| right(ui, format::rate(m.disk_read_per_sec)));
-        table_row.col(|ui| right(ui, format::rate(m.disk_write_per_sec)));
-        table_row.col(|ui| {
-            if m.start_time != 0 {
-                right(
-                    ui,
-                    format::elapsed(self.snapshot.unix_time.saturating_sub(m.start_time)),
-                );
-            }
-        });
-        table_row.col(|ui| {
-            if let Some(exe) = m.exe {
-                ui.label(exe.display().to_string());
-            }
-        });
+                TableColumn::ParentPid => {
+                    if let (false, Some(ppid)) = (is_aggregate, m.parent_pid) {
+                        right(ui, ppid.to_string());
+                    }
+                }
+                TableColumn::Cpu => right(ui, format::cpu(m.cpu_percent)),
+                TableColumn::CpuHistory => {
+                    if let RowKind::Group(g) = row.kind {
+                        if let Some(h) = history.group(&self.view.groups[g].key) {
+                            let size = egui::vec2(ui.available_width(), ui.available_height() - 4.0);
+                            graphs::sparkline(ui, history, h, size);
+                        }
+                    }
+                }
+                TableColumn::WorkingSet => right(ui, format::mem(m.working_set)),
+                TableColumn::Private => right(ui, format::mem(m.private_bytes)),
+                TableColumn::DiskRead => right(ui, format::rate(m.disk_read_per_sec)),
+                TableColumn::DiskWrite => right(ui, format::rate(m.disk_write_per_sec)),
+                TableColumn::Started => {
+                    if m.start_time != 0 {
+                        right(
+                            ui,
+                            format::elapsed(self.snapshot.unix_time.saturating_sub(m.start_time)),
+                        );
+                    }
+                }
+                TableColumn::Path => {
+                    if let Some(exe) = m.exe {
+                        ui.label(exe.display().to_string());
+                    }
+                }
+            });
+        }
 
         let response = table_row.response();
         if action.is_none() {
@@ -447,6 +734,16 @@ impl TaskManagerApp {
                 .collect(),
             RowKind::Process(i) => vec![ProcTarget::of(&procs[i])],
         };
+        if ui.button("App details").clicked() {
+            let key = match row.kind {
+                RowKind::Group(g) => Arc::clone(&self.view.groups[g].key),
+                RowKind::Process(i) => Arc::clone(&procs[i].group_key),
+            };
+            *action = Some(UiAction::Details(key));
+            ui.close_menu();
+        }
+        ui.separator();
+
         let mut run = |ui: &mut egui::Ui, request: Request| {
             *action = Some(UiAction::Run(request));
             ui.close_menu();
@@ -491,6 +788,82 @@ impl TaskManagerApp {
         }
     }
 
+    /// History graphs and the process list of the app with group `key`.
+    fn detail_panel(&self, ui: &mut egui::Ui, key: &str, history: &History) -> Option<UiAction> {
+        profile_scope!("details pane");
+        let procs = &self.snapshot.processes;
+        let mut members: Vec<usize> = (0..procs.len())
+            .filter(|&i| &*procs[i].group_key == key)
+            .collect();
+        members.sort_by(|&a, &b| {
+            procs[b]
+                .cpu_percent
+                .total_cmp(&procs[a].cpu_percent)
+                .then(procs[a].pid.cmp(&procs[b].pid))
+        });
+        let group_history = history.group(key);
+        let mut action = None;
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let name = members
+                .first()
+                .map(|&i| &*procs[i].name)
+                .or(group_history.map(|g| &*g.name))
+                .unwrap_or(key);
+            ui.heading(name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✖").on_hover_text("Close (Esc)").clicked() {
+                    action = Some(UiAction::CloseDetails);
+                }
+            });
+        });
+        match members.first().and_then(|&i| procs[i].exe.as_ref()) {
+            Some(exe) => {
+                ui.add(egui::Label::new(egui::RichText::new(exe.display().to_string()).weak()).truncate());
+            }
+            None if members.is_empty() => {
+                ui.colored_label(ui.visuals().warn_fg_color, "Not running");
+            }
+            None => {}
+        }
+        ui.separator();
+
+        match group_history {
+            Some(g) => graphs::group_plots(ui, history, g),
+            None => {
+                ui.weak("No history yet");
+            }
+        }
+
+        ui.add_space(6.0);
+        let noun = if members.len() == 1 { "process" } else { "processes" };
+        ui.strong(format!("{} {noun}", members.len()));
+        egui::Grid::new("detail_procs")
+            .num_columns(4)
+            .striped(true)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                for label in ["Name", "PID", "CPU %", "Memory"] {
+                    ui.strong(label);
+                }
+                ui.end_row();
+                for &i in &members {
+                    let p = &procs[i];
+                    let id = RowId::Proc(ProcKey::of(p));
+                    let selected = self.selected.as_ref() == Some(&id);
+                    if ui.selectable_label(selected, &*p.name).clicked() {
+                        action = Some(UiAction::Reveal(id));
+                    }
+                    ui.label(p.pid.to_string());
+                    ui.label(format::cpu(p.cpu_percent));
+                    ui.label(format::mem(p.working_set));
+                    ui.end_row();
+                }
+            });
+        action
+    }
+
     fn show_toasts(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.toasts.retain(|t| t.expires > now);
@@ -528,83 +901,253 @@ impl TaskManagerApp {
     }
 }
 
+/// Draws the panes of the dock. Actions are applied after the dock is
+/// drawn, once it is back in the app.
+struct Panes<'a> {
+    app: &'a mut TaskManagerApp,
+    history: &'a History,
+    scroll_to: Option<usize>,
+    actions: Vec<UiAction>,
+}
+
+impl TabViewer for Panes<'_> {
+    type Tab = Pane;
+
+    fn title(&mut self, pane: &mut Pane) -> egui::WidgetText {
+        pane.title().into()
+    }
+
+    fn id(&mut self, pane: &mut Pane) -> egui::Id {
+        egui::Id::new(("pane", *pane))
+    }
+
+    /// The table, treemap and graphs fill their pane; the others scroll.
+    fn scroll_bars(&self, pane: &Pane) -> [bool; 2] {
+        match pane {
+            Pane::Details | Pane::Mini => [false, true],
+            Pane::Processes | Pane::Treemap | Pane::Performance => [false, false],
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, pane: &mut Pane) {
+        let app = &mut *self.app;
+        let action = match pane {
+            Pane::Processes => {
+                app.view_controls(ui);
+                ui.add_space(2.0);
+                // Apply filter/mode edits this frame.
+                app.refresh_view();
+                app.process_table(ui, self.scroll_to, self.history)
+            }
+            Pane::Treemap => app
+                .treemap
+                .ui(ui, &app.snapshot.processes, app.selected.as_ref())
+                .map(UiAction::Reveal),
+            Pane::Performance => {
+                profile_scope!("performance pane");
+                graphs::system(ui, self.history, &app.snapshot.system);
+                None
+            }
+            Pane::Details => match app.detail.clone() {
+                Some(key) => app.detail_panel(ui, &key, self.history),
+                None => {
+                    ui.add_space(8.0);
+                    ui.weak("Click an app in the table or the treemap to see its history and processes.");
+                    None
+                }
+            },
+            Pane::Mini => {
+                app.mini_view(ui, self.history);
+                None
+            }
+        };
+        self.actions.extend(action);
+    }
+}
+
 impl eframe::App for TaskManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        profile_scope!("update");
         self.snapshot = self.sampler.latest();
         while let Ok(outcome) = self.outcome_rx.try_recv() {
-            let lifetime = if outcome.is_error { TOAST_ERROR } else { TOAST_INFO };
-            self.toasts.push(Toast {
-                message: outcome.message,
-                is_error: outcome.is_error,
-                expires: Instant::now() + lifetime,
+            self.toast(outcome.message, outcome.is_error);
+        }
+
+        // Held for this frame only; the sampler waits on it just to append.
+        let history = Arc::clone(&self.history);
+        let history = history.lock().unwrap();
+
+        let menu = egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
+        let preset = menu.inner;
+        let below_menu = ctx.screen_rect().with_min_y(menu.response.rect.max.y);
+        if self.settings.totals_bar {
+            egui::TopBottomPanel::top("totals").show(ctx, |ui| {
+                profile_scope!("totals bar");
+                ui.add_space(4.0);
+                self.totals_panel(ui, &history);
+                ui.add_space(4.0);
             });
         }
 
-        egui::TopBottomPanel::top("totals").show(ctx, |ui| {
-            ui.add_space(4.0);
-            self.totals_panel(ui);
-            ui.add_space(2.0);
-            self.view_controls(ui);
-            ui.add_space(4.0);
+        self.refresh_view();
+
+        // Forget an app that exited and whose history is gone.
+        let detail_gone = self.detail.as_ref().is_some_and(|key| {
+            history.group(key).is_none() && !self.snapshot.processes.iter().any(|p| p.group_key == *key)
         });
-
-        // Rebuild after the controls so filter/mode edits apply this frame.
-        if self.view_dirty || self.view_seq != self.snapshot.seq {
-            self.view = self.state.build(&self.snapshot);
-            // Always, so the treemap's process indices match the snapshot.
-            self.treemap.set_groups(self.state.app_groups(&self.snapshot));
-            self.view_seq = self.snapshot.seq;
-            self.view_dirty = false;
-        }
-
-        if self.show_treemap {
-            let max_height = (ctx.screen_rect().height() - 250.0).max(150.0);
-            let picked = egui::TopBottomPanel::top("treemap")
-                .resizable(true)
-                .default_height(300.0)
-                .height_range(120.0..=max_height)
-                .show(ctx, |ui| {
-                    self.treemap
-                        .ui(ui, &self.snapshot.processes, self.selected.as_ref())
-                })
-                .inner;
-            if let Some(id) = picked {
-                self.apply(UiAction::Reveal(id));
-            }
+        if detail_gone {
+            self.detail = None;
         }
 
         let scroll_to = std::mem::take(&mut self.scroll_to_selected)
             .then(|| self.selected_row_index())
             .flatten();
-        let action = egui::CentralPanel::default()
-            .show(ctx, |ui| self.process_table(ui, scroll_to))
-            .inner;
-        if let Some(action) = action {
+        let mut dock = std::mem::replace(&mut self.dock, DockState::new(Vec::new()));
+        let mut panes = Panes {
+            app: self,
+            history: &history,
+            scroll_to,
+            actions: Vec::new(),
+        };
+        {
+            profile_scope!("dock");
+            DockArea::new(&mut dock)
+                .show_add_buttons(false)
+                .show(ctx, &mut panes);
+        }
+        let actions = panes.actions;
+        self.dock = dock;
+        for action in actions {
             self.apply(action);
+        }
+        drop(history);
+
+        settings::window(ctx, below_menu, &mut self.show_settings, &mut self.settings, hotkey::LABEL);
+        if let Some(preset) = preset {
+            self.apply_preset(preset, ctx);
+        }
+
+        let unfocused = ctx.memory(|m| m.focused().is_none());
+        if unfocused && self.detail.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.apply(UiAction::CloseDetails);
         }
 
         // Delete ends the selection, unless a text field has focus.
-        if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+        if unfocused && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             let targets = self.selected_targets();
             if !targets.is_empty() {
                 self.run(Request::End(targets));
             }
         }
 
+        if self.apply_settings(ctx) {
+            ctx.request_repaint();
+        }
         self.show_toasts(ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let persisted = Persisted {
+            settings: self.settings.clone(),
+            mode: self.state.mode,
+            sort: self.state.sort,
+            compact_restore: self.compact_restore,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &persisted);
+        eframe::set_value(storage, DOCK_KEY, &self.dock);
     }
 }
 
-fn right(ui: &mut egui::Ui, text: String) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(text);
-    });
+/// Starts sampling with the NT backend, or with sysinfo when built with
+/// feature `sysinfo` and run with `FTM_SOURCE=sysinfo` (for comparisons).
+fn spawn_sampler(interval: Duration, ctx: egui::Context) -> SamplerHandle {
+    let notify = move || ctx.request_repaint();
+    #[cfg(feature = "sysinfo")]
+    if std::env::var_os("FTM_SOURCE").is_some_and(|v| v == "sysinfo") {
+        return SamplerHandle::spawn(crate::source::SysinfoSource::new(), interval, notify);
+    }
+    SamplerHandle::spawn(NtSource::new(), interval, notify)
 }
 
-fn interval_label(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms} ms")
-    } else {
-        format!("{} s", ms / 1000)
+/// Width rules of a table column; the last one takes the remaining width.
+fn column_spec(column: TableColumn, last: bool) -> Column {
+    let (initial, min) = match column {
+        TableColumn::Name => (260.0, 80.0),
+        TableColumn::Pid | TableColumn::ParentPid | TableColumn::Cpu => (60.0, 40.0),
+        TableColumn::CpuHistory => (SPARKLINE_WIDTH, 40.0),
+        TableColumn::Path => (300.0, 80.0),
+        _ => (90.0, 50.0),
+    };
+    let spec = if last { Column::remainder() } else { Column::initial(initial) };
+    spec.at_least(min).clip(true)
+}
+
+/// Right-aligned text filling the cell. Painted directly: a right-to-left
+/// child layout would add a `Ui` (and its allocations) to every cell of every
+/// visible row, every frame.
+fn right(ui: &mut egui::Ui, text: String) {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let rect = egui::Align2::RIGHT_CENTER.align_size_within_rect(galley.size(), ui.max_rect());
+    let response = ui.allocate_rect(rect, egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text()));
+    ui.painter().galley(rect.min, galley, ui.visuals().text_color());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn persisted_state_round_trips() {
+        let mut saved = Persisted {
+            mode: ViewMode::Tree,
+            compact_restore: Some([800.0, 600.0]),
+            ..Persisted::default()
+        };
+        saved.settings.columns.swap(0, 3);
+        saved.settings.columns[1].visible = false;
+        saved.settings.appearance.theme = settings::Theme::Light;
+
+        let dock = Preset::Visual.dock();
+
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(&mut storage, eframe::APP_KEY, &saved);
+        eframe::set_value(&mut storage, DOCK_KEY, &dock);
+        let loaded: Persisted = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!(loaded.settings, saved.settings);
+        assert_eq!(loaded.mode, ViewMode::Tree);
+        assert_eq!(loaded.compact_restore, saved.compact_restore);
+        let loaded_dock: DockState<Pane> = eframe::get_value(&storage, DOCK_KEY).unwrap();
+        let tabs = |d: &DockState<Pane>| d.iter_all_tabs().map(|((s, n), &t)| (s, n, t)).collect::<Vec<_>>();
+        assert_eq!(tabs(&loaded_dock), tabs(&dock));
+    }
+
+    #[test]
+    fn partial_save_takes_defaults() {
+        let mut storage = MemoryStorage::default();
+        storage.0.insert(eframe::APP_KEY.to_owned(), "(mode: Processes)".to_owned());
+        let loaded: Persisted = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!(loaded.mode, ViewMode::Processes);
+        assert_eq!(loaded.settings, Settings::default());
     }
 }

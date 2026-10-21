@@ -1,6 +1,7 @@
 //! Immutable data published by the sampler and read by the UI.
 
-use std::path::PathBuf;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One process, with rates already computed from deltas between samples.
@@ -8,8 +9,12 @@ use std::time::Duration;
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: Option<u32>,
-    pub name: String,
-    pub exe: Option<PathBuf>,
+    /// Name, path and group key never change while a process runs; they
+    /// are shared from one snapshot to the next rather than copied.
+    pub name: Arc<str>,
+    pub exe: Option<Arc<Path>>,
+    /// The app group it belongs to (`view::group_key`).
+    pub group_key: Arc<str>,
     /// 0..=100, normalized to all logical cores (100% = every core saturated).
     pub cpu_percent: f32,
     pub working_set: u64,

@@ -6,18 +6,24 @@
 //! apps stay roughly where they were. Tiles too small to read are lumped into
 //! one "Other" tile.
 //!
-//! Tiles animate from where they were drawn to their new target over `ANIM`.
-//! Repaints are requested only while that transition runs; at rest the map
-//! costs nothing until the next snapshot or input.
+//! Tiles animate from where they were drawn to their new target over `ANIM`,
+//! but only when something visibly moves: a tile enters or leaves, or a
+//! corner moves by `MIN_MOVE` px or more. Smaller moves and color changes
+//! snap, so an idle system's usual jitter costs no extra frames. Repaints are
+//! requested only while a transition runs; at rest the map costs nothing
+//! until the next snapshot or input.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Layout, PointerButton, Pos2, Rect, RichText,
     Sense, Stroke, StrokeKind, Vec2,
 };
-use eframe::epaint::text::{LayoutJob, TextFormat, TextWrapping};
+use eframe::epaint::text::{Galley, LayoutJob, TextFormat, TextWrapping};
+use eframe::epaint::{mutex::Mutex, TextureAtlas};
+use serde::{Deserialize, Serialize};
 
 use crate::format;
 use crate::model::ProcessInfo;
@@ -33,10 +39,21 @@ const KEEP_FACTOR: f64 = 0.5;
 /// In the stable order, a tile moves ahead of the one before it only when it
 /// is this many times bigger.
 const REORDER_RATIO: f64 = 1.5;
-/// Corners moving less than this (px) don't need an animation.
-const STILL: f32 = 0.5;
+/// Corners moving less than this (px) snap instead of animating. Every
+/// transition repaints for `ANIM`, so animating sub-pixel jitter would keep
+/// an idle window repainting after nearly every snapshot.
+const MIN_MOVE: f32 = 3.0;
+/// The default color scale, cool to hot.
+pub const DEFAULT_GRADIENT: [[u8; 3]; 6] = [
+    [49, 84, 140],
+    [38, 128, 150],
+    [66, 150, 98],
+    [196, 176, 58],
+    [224, 122, 44],
+    [208, 52, 44],
+];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Metric {
     Memory,
     Cpu,
@@ -44,9 +61,9 @@ pub enum Metric {
 }
 
 impl Metric {
-    const ALL: [Metric; 3] = [Metric::Memory, Metric::Cpu, Metric::Disk];
+    pub const ALL: [Metric; 3] = [Metric::Memory, Metric::Cpu, Metric::Disk];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
             Self::Cpu => "CPU",
@@ -88,11 +105,12 @@ impl Metric {
         h.clamp(0.0, 1.0) as f32
     }
 
+    /// Labels of the low and high (and beyond) ends of the color scale.
     fn legend(self) -> (&'static str, &'static str) {
         match self {
-            Self::Cpu => ("0%", "50%"),
-            Self::Memory => ("10 MB", "4 GB"),
-            Self::Disk => ("1 KB/s", "100 MB/s"),
+            Self::Cpu => ("0%", "50%+"),
+            Self::Memory => ("10 MB", "4 GB+"),
+            Self::Disk => ("1 KB/s", "100 MB/s+"),
         }
     }
 }
@@ -130,19 +148,33 @@ impl From<&Metrics<'_>> for Stats {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TileKey {
-    Group(String),
+    Group(Arc<str>),
     Proc(ProcKey),
     Other,
 }
 
 struct Tile {
     key: TileKey,
-    name: String,
+    name: Arc<str>,
     /// Path, PID, or what "Other" contains; shown in the tooltip.
     detail: String,
     /// Processes this tile stands for.
     members: Vec<ProcKey>,
     stats: Stats,
+    /// The label: name, size value, color value. Set by `rebuild`.
+    lines: Vec<String>,
+    labels: Option<Labels>,
+}
+
+/// A tile's label lines laid out for one width and color. Reused across
+/// frames while those and egui's font atlas stay the same: egui replaces the
+/// atlas when the scale changes or it fills up, which moves every glyph.
+struct Labels {
+    width: f32,
+    color: Color32,
+    /// Keeps the address from being reused while it is compared.
+    atlas: Weak<Mutex<TextureAtlas>>,
+    galleys: Vec<Arc<Galley>>,
 }
 
 impl Tile {
@@ -173,10 +205,12 @@ impl Tile {
         let noun = if drilled { "processes" } else { "apps" };
         Tile {
             key: TileKey::Other,
-            name: format!("Other ({})", lumped.len()),
+            name: format!("Other ({})", lumped.len()).into(),
             detail: format!("{} smaller {noun}", lumped.len()),
             members,
             stats,
+            lines: Vec::new(),
+            labels: None,
         }
     }
 }
@@ -199,11 +233,13 @@ impl Sprite {
         (rect, self.from_heat + (self.to_heat - self.from_heat) * e)
     }
 
-    fn is_still(&self) -> bool {
-        self.tile.is_some()
-            && (self.from.min - self.to.min).abs().max_elem() < STILL
-            && (self.from.max - self.to.max).abs().max_elem() < STILL
-            && (self.from_heat - self.to_heat).abs() < 1e-3
+    /// Whether this sprite is worth a transition: it is leaving, or a corner
+    /// moves visibly. A color change alone snaps (it still blends while
+    /// something else animates).
+    fn moves(&self) -> bool {
+        self.tile.is_none()
+            || (self.from.min - self.to.min).abs().max_elem() >= MIN_MOVE
+            || (self.from.max - self.to.max).abs().max_elem() >= MIN_MOVE
     }
 }
 
@@ -213,7 +249,7 @@ enum Zoom {
     /// The group tile's rectangle when it was double-clicked.
     In(Rect),
     /// The group being left; its tile is found in the new layout.
-    Out(String),
+    Out(Arc<str>),
 }
 
 /// Everything the layout depends on; it is recomputed when this changes.
@@ -222,7 +258,7 @@ struct BuildKey {
     data_gen: u64,
     size_metric: Metric,
     color_metric: Metric,
-    drill: Option<String>,
+    drill: Option<Arc<str>>,
     size: Vec2,
 }
 
@@ -230,7 +266,7 @@ pub struct Treemap {
     size_metric: Metric,
     color_metric: Metric,
     /// Group key of the app being shown as its processes.
-    drill: Option<String>,
+    drill: Option<Arc<str>>,
     zoom: Option<Zoom>,
     groups: Vec<Group>,
     data_gen: u64,
@@ -241,6 +277,10 @@ pub struct Treemap {
     /// Start of the running transition; `None` at rest.
     anim_start: Option<Instant>,
     built: Option<BuildKey>,
+    /// Color scale stops, cool to hot.
+    gradient: Vec<Color32>,
+    /// Selected tiles' rectangles, gathered while drawing (reused).
+    outlined: Vec<Rect>,
 }
 
 impl Default for Treemap {
@@ -257,6 +297,8 @@ impl Default for Treemap {
             order: Vec::new(),
             anim_start: None,
             built: None,
+            gradient: to_colors(&DEFAULT_GRADIENT),
+            outlined: Vec::new(),
         }
     }
 }
@@ -269,8 +311,18 @@ impl Treemap {
         self.data_gen += 1;
     }
 
+    pub fn set_metrics(&mut self, size: Metric, color: Metric) {
+        self.size_metric = size;
+        self.color_metric = color;
+    }
+
+    pub fn set_gradient(&mut self, stops: &[[u8; 3]]) {
+        self.gradient = to_colors(stops);
+    }
+
     /// Draws the map. Returns the row the user clicked, if any.
     pub fn ui(&mut self, ui: &mut egui::Ui, procs: &[ProcessInfo], selected: Option<&RowId>) -> Option<RowId> {
+        profile_scope!("treemap");
         self.header(ui, procs);
         let size = ui.available_size().max(vec2(1.0, 1.0));
         let (response, painter) = ui.allocate_painter(size, Sense::click());
@@ -299,15 +351,16 @@ impl Treemap {
 
         let origin = area.min.to_vec2();
         let pointer = response.hover_pos();
+        let atlas = ui.fonts(|f| f.texture_atlas());
         let mut hovered: Option<(usize, Rect)> = None;
-        let mut outlined = Vec::new();
+        self.outlined.clear();
         for sprite in &self.sprites {
             let (rect, heat) = sprite.at(e);
             let rect = rect.translate(origin);
             if rect.width() < 1.0 || rect.height() < 1.0 {
                 continue;
             }
-            let mut fill = heat_color(heat);
+            let mut fill = heat_color(heat, &self.gradient);
             match sprite.tile {
                 None => fill = fill.gamma_multiply(1.0 - e),
                 Some(i) => {
@@ -315,17 +368,17 @@ impl Treemap {
                         hovered = Some((i, rect));
                     }
                     if selected.is_some_and(|s| self.tiles[i].is_selected(s)) {
-                        outlined.push(rect);
+                        self.outlined.push(rect);
                     }
                 }
             }
             // Shrinking by half a pixel leaves a 1 px gap between tiles.
             painter.rect_filled(rect.shrink(0.5), 2.0, fill);
             if let Some(i) = sprite.tile {
-                self.draw_labels(&painter, &self.tiles[i], rect, fill);
+                draw_labels(&painter, &mut self.tiles[i], rect, fill, &atlas);
             }
         }
-        for rect in outlined {
+        for &rect in &self.outlined {
             painter.rect_stroke(rect.shrink(0.5), 2.0, Stroke::new(1.0_f32, Color32::BLACK), StrokeKind::Inside);
             painter.rect_stroke(rect.shrink(1.5), 2.0, Stroke::new(2.0_f32, Color32::WHITE), StrokeKind::Inside);
         }
@@ -388,7 +441,7 @@ impl Treemap {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                legend(ui, self.color_metric);
+                legend(ui, self.color_metric, &self.gradient);
                 metric_combo(ui, "treemap_color", &mut self.color_metric);
                 ui.label("Color:");
                 ui.separator();
@@ -425,6 +478,7 @@ impl Treemap {
         if self.built.as_ref() == Some(&key) {
             return;
         }
+        profile_scope!("treemap rebuild");
         let prev = self.built.replace(key);
         let drill_changed = prev.as_ref().is_some_and(|p| p.drill != self.drill);
         // A fresh view gets a fresh order; a resize or the first build snaps.
@@ -433,13 +487,16 @@ impl Treemap {
 
         let e = ease(self.progress());
         let prev_order = if fresh { &[][..] } else { &self.order[..] };
-        let tiles = arrange(
+        let mut tiles = arrange(
             self.collect_tiles(procs),
             self.size_metric,
             prev_order,
             size.x * size.y,
             self.drill.is_some(),
         );
+        for tile in &mut tiles {
+            tile.lines = self.label_lines(tile);
+        }
         let values: Vec<f32> = tiles.iter().map(|t| self.size_metric.value(&t.stats) as f32).collect();
         let bounds = Rect::from_min_size(Pos2::ZERO, size);
         let targets = squarify(&values, bounds);
@@ -500,11 +557,8 @@ impl Treemap {
         }
         drop(current);
 
-        self.anim_start = if sprites.iter().all(Sprite::is_still) {
-            None
-        } else {
-            Some(Instant::now())
-        };
+        // At rest, sprites are drawn at `to`: small changes snap.
+        self.anim_start = sprites.iter().any(Sprite::moves).then(Instant::now);
         self.order = tiles.iter().map(|t| t.key.clone()).collect();
         self.tiles = tiles;
         self.sprites = sprites;
@@ -522,10 +576,12 @@ impl Treemap {
                     let p = &procs[i];
                     Tile {
                         key: TileKey::Proc(ProcKey::of(p)),
-                        name: p.name.clone(),
+                        name: Arc::clone(&p.name),
                         detail: format!("PID {}", p.pid),
                         members: vec![ProcKey::of(p)],
                         stats: Stats::from(&Metrics::of(p)),
+                        lines: Vec::new(),
+                        labels: None,
                     }
                 })
                 .collect(),
@@ -535,51 +591,78 @@ impl Treemap {
                 .map(|g| {
                     let m = g.metrics(procs);
                     Tile {
-                        key: TileKey::Group(g.key.clone()),
-                        name: m.name.to_owned(),
+                        key: TileKey::Group(Arc::clone(&g.key)),
+                        name: Arc::clone(&procs[g.members[0]].name),
                         detail: m.exe.map(|e| e.display().to_string()).unwrap_or_default(),
                         members: g.members.iter().map(|&i| ProcKey::of(&procs[i])).collect(),
                         stats: Stats::from(&m),
+                        lines: Vec::new(),
+                        labels: None,
                     }
                 })
                 .collect(),
         }
     }
 
-    /// Name, then the size value, then the color value, as many lines as fit.
-    fn draw_labels(&self, painter: &egui::Painter, tile: &Tile, rect: Rect, fill: Color32) {
-        let inner = rect.shrink2(vec2(5.0, 3.0));
-        if inner.width() < 28.0 || inner.height() < 13.0 {
-            return;
+    /// Name, then the size value, then the color value.
+    fn label_lines(&self, tile: &Tile) -> Vec<String> {
+        let mut lines = vec![tile.name.to_string(), self.size_metric.format(&tile.stats)];
+        if self.color_metric != self.size_metric {
+            lines.push(self.color_metric.format(&tile.stats));
         }
-        let color = if luminance(fill) > 0.55 {
-            Color32::from_black_alpha(230)
-        } else {
-            Color32::WHITE
-        };
-        let lines = [
-            Some(tile.name.clone()),
-            Some(self.size_metric.format(&tile.stats)),
-            (self.color_metric != self.size_metric).then(|| self.color_metric.format(&tile.stats)),
-        ];
-        let mut y = inner.min.y;
-        for (k, text) in lines.into_iter().flatten().enumerate() {
-            let font = FontId::proportional(if k == 0 { 13.0 } else { 11.0 });
-            let mut job = LayoutJob::single_section(text, TextFormat::simple(font, color));
-            job.wrap = TextWrapping {
-                max_width: inner.width(),
-                max_rows: 1,
-                break_anywhere: true,
-                overflow_character: Some('…'),
-            };
-            let galley = painter.layout_job(job);
-            if y + galley.size().y > inner.max.y + 1.0 {
-                break;
-            }
-            let height = galley.size().y;
-            painter.galley(pos2(inner.min.x, y), galley, color);
-            y += height;
+        lines
+    }
+}
+
+/// Draws as many of the tile's label lines as fit, laying them out again
+/// only when the width, color or font atlas changed.
+fn draw_labels(painter: &egui::Painter, tile: &mut Tile, rect: Rect, fill: Color32, atlas: &Arc<Mutex<TextureAtlas>>) {
+    let inner = rect.shrink2(vec2(5.0, 3.0));
+    if inner.width() < 28.0 || inner.height() < 13.0 {
+        return;
+    }
+    let color = if luminance(fill) > 0.55 {
+        Color32::from_black_alpha(230)
+    } else {
+        Color32::WHITE
+    };
+    let fresh = tile.labels.as_ref().is_some_and(|l| {
+        l.width == inner.width() && l.color == color && Weak::as_ptr(&l.atlas) == Arc::as_ptr(atlas)
+    });
+    if !fresh {
+        let galleys = tile
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(k, text)| {
+                let font = FontId::proportional(if k == 0 { 13.0 } else { 11.0 });
+                let mut job = LayoutJob::single_section(text.clone(), TextFormat::simple(font, color));
+                job.wrap = TextWrapping {
+                    max_width: inner.width(),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                painter.layout_job(job)
+            })
+            .collect();
+        tile.labels = Some(Labels {
+            width: inner.width(),
+            color,
+            atlas: Arc::downgrade(atlas),
+            galleys,
+        });
+    }
+    let Some(labels) = &tile.labels else {
+        return;
+    };
+    let mut y = inner.min.y;
+    for galley in &labels.galleys {
+        if y + galley.size().y > inner.max.y + 1.0 {
+            break;
         }
+        painter.galley(pos2(inner.min.x, y), Arc::clone(galley), color);
+        y += galley.size().y;
     }
 }
 
@@ -740,28 +823,28 @@ fn ease(t: f32) -> f32 {
 }
 
 /// Cool-to-hot gradient: blue, teal, green, yellow, orange, red.
-fn heat_color(heat: f32) -> Color32 {
-    const STOPS: [[u8; 3]; 6] = [
-        [49, 84, 140],
-        [38, 128, 150],
-        [66, 150, 98],
-        [196, 176, 58],
-        [224, 122, 44],
-        [208, 52, 44],
-    ];
-    let x = heat.clamp(0.0, 1.0) * (STOPS.len() - 1) as f32;
-    let i = (x as usize).min(STOPS.len() - 2);
-    let f = x - i as f32;
-    let (a, b) = (STOPS[i], STOPS[i + 1]);
-    let mix = |k: usize| (f32::from(a[k]) + (f32::from(b[k]) - f32::from(a[k])) * f).round() as u8;
-    Color32::from_rgb(mix(0), mix(1), mix(2))
+fn to_colors(stops: &[[u8; 3]]) -> Vec<Color32> {
+    stops.iter().map(|&[r, g, b]| Color32::from_rgb(r, g, b)).collect()
+}
+
+/// `heat` (0..=1) on the gradient through `stops`.
+fn heat_color(heat: f32, stops: &[Color32]) -> Color32 {
+    match stops {
+        [] => Color32::GRAY,
+        [only] => *only,
+        _ => {
+            let x = heat.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+            let i = (x as usize).min(stops.len() - 2);
+            stops[i].lerp_to_gamma(stops[i + 1], x - i as f32)
+        }
+    }
 }
 
 fn luminance(c: Color32) -> f32 {
     (0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())) / 255.0
 }
 
-fn metric_combo(ui: &mut egui::Ui, id: &str, value: &mut Metric) {
+pub fn metric_combo(ui: &mut egui::Ui, id: &str, value: &mut Metric) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(value.label())
         .show_ui(ui, |ui| {
@@ -772,24 +855,35 @@ fn metric_combo(ui: &mut egui::Ui, id: &str, value: &mut Metric) {
 }
 
 /// The color scale, low end on the left (added right to left).
-fn legend(ui: &mut egui::Ui, metric: Metric) {
-    const STEPS: usize = 16;
+fn legend(ui: &mut egui::Ui, metric: Metric, stops: &[Color32]) {
     let (lo, hi) = metric.legend();
-    ui.label(RichText::new(format!("{hi}+")).small());
-    let (bar, response) = ui.allocate_exact_size(vec2(80.0, 10.0), Sense::hover());
+    ui.label(RichText::new(hi).small());
+    gradient_bar(ui, stops, vec2(80.0, 10.0)).on_hover_ui(|ui| {
+        ui.label(format!("Color: {} (log scale)", metric.label()));
+    });
+    ui.label(RichText::new(lo).small());
+}
+
+/// Paints the color scale through `stops`, cool end on the left.
+pub fn gradient_preview(ui: &mut egui::Ui, stops: &[[u8; 3]], size: Vec2) -> egui::Response {
+    gradient_bar(ui, &to_colors(stops), size)
+}
+
+fn gradient_bar(ui: &mut egui::Ui, stops: &[Color32], size: Vec2) -> egui::Response {
+    const STEPS: usize = 32;
+    let (bar, response) = ui.allocate_exact_size(size, Sense::hover());
     let step = bar.width() / STEPS as f32;
     for k in 0..STEPS {
         let x = bar.min.x + k as f32 * step;
         let segment = Rect::from_min_max(pos2(x, bar.min.y), pos2(x + step + 0.5, bar.max.y));
         ui.painter()
-            .rect_filled(segment, 0.0, heat_color((k as f32 + 0.5) / STEPS as f32));
+            .rect_filled(segment, 0.0, heat_color((k as f32 + 0.5) / STEPS as f32, stops));
     }
-    response.on_hover_text(format!("Color: {} (log scale)", metric.label()));
-    ui.label(RichText::new(lo).small());
+    response
 }
 
 fn tooltip(ui: &mut egui::Ui, tile: &Tile) {
-    ui.strong(&tile.name);
+    ui.strong(&*tile.name);
     if !tile.detail.is_empty() {
         ui.label(RichText::new(&tile.detail).weak());
     }
@@ -851,6 +945,26 @@ mod tests {
     }
 
     #[test]
+    fn only_visible_moves_animate() {
+        let r = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 50.0));
+        let sprite = |to: Rect, tile| Sprite {
+            key: TileKey::Other,
+            tile,
+            from: r,
+            to,
+            from_heat: 0.1,
+            to_heat: 0.9,
+        };
+        // A color change alone, or jitter under MIN_MOVE, snaps.
+        assert!(!sprite(r, Some(0)).moves());
+        assert!(!sprite(r.translate(vec2(2.0, -1.0)), Some(0)).moves());
+        assert!(sprite(r.translate(vec2(MIN_MOVE, 0.0)), Some(0)).moves());
+        assert!(sprite(r.expand(MIN_MOVE), Some(0)).moves());
+        // A tile that left the map always shrinks away.
+        assert!(sprite(r, None).moves());
+    }
+
+    #[test]
     fn stable_order_resists_small_changes() {
         // Previously a, b, c. b grew a little: stays put. c grew a lot: moves to the front.
         let mut items = vec![("c", 30.0), ("b", 12.0), ("a", 10.0), ("new", 50.0)];
@@ -862,14 +976,16 @@ mod tests {
 
     fn tile(name: &str, mem: u64) -> Tile {
         Tile {
-            key: TileKey::Group(name.to_owned()),
-            name: name.to_owned(),
+            key: TileKey::Group(name.into()),
+            name: name.into(),
             detail: String::new(),
             members: Vec::new(),
             stats: Stats {
                 working_set: mem,
                 ..Default::default()
             },
+            lines: Vec::new(),
+            labels: None,
         }
     }
 
@@ -879,7 +995,7 @@ mod tests {
         tiles.extend((0..50).map(|i| tile(&format!("tiny{i}"), 1)));
         // 10_000 px² for ~1550 units: a tiny tile would get ~6 px².
         let out = arrange(tiles, Metric::Memory, &[], 10_000.0, false);
-        let names: Vec<&str> = out.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = out.iter().map(|t| &*t.name).collect();
         assert_eq!(names, ["big", "mid", "Other (50)"]);
         assert_eq!(out[2].stats.working_set, 50);
     }
