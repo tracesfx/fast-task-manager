@@ -5,7 +5,11 @@
 //! samples, so a backend only has to read counters. This maps directly onto
 //! `NtQuerySystemInformation(SystemProcessInformation)`, which returns
 //! KernelTime/UserTime and I/O transfer counts per process.
+//!
+//! GPU usage is the exception (like system CPU %): it comes from performance
+//! counters that already report percentages; see `gpu`.
 
+mod gpu;
 mod sysinfo_source;
 
 pub use sysinfo_source::SysinfoSource;
@@ -29,6 +33,11 @@ pub struct RawProcess {
     pub read_bytes_total: u64,
     /// Total bytes written since the process started.
     pub write_bytes_total: u64,
+    /// Busiest GPU engine, 0..=100 (pre-computed by the counter source).
+    pub gpu_percent: f32,
+    /// Dedicated / shared GPU memory committed, bytes (current, not cumulative).
+    pub gpu_dedicated: u64,
+    pub gpu_shared: u64,
     /// Seconds since the Unix epoch; 0 if unknown.
     pub start_time: u64,
 }
@@ -37,7 +46,8 @@ pub struct RawProcess {
 pub struct RawSample {
     pub processes: Vec<RawProcess>,
     /// System totals are already percentages; a backend that reads raw
-    /// per-core idle/busy times computes them internally.
+    /// per-core idle/busy times computes them internally. `system.gpu` is
+    /// `None` when GPU counters are unavailable.
     pub system: SystemTotals,
 }
 

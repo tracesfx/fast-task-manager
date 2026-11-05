@@ -26,6 +26,13 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
   (CPU time, total bytes read/written), not rates, into a reused `RawSample` buffer.
   `SysinfoSource` is the only backend; the plan is a `NtQuerySystemInformation`
   backend later. Exception: system CPU % / per-core % come pre-computed.
+- `src/source/gpu.rs` — GPU usage via PDH performance counters (`GPU Engine`,
+  `GPU Process Memory`, `GPU Adapter Memory`; English names via
+  `PdhAddEnglishCounterW`), owned by `SysinfoSource` and joined by PID. Also
+  pre-computed: PDH formats engine `Utilization Percentage` over the time between
+  collects. Per-process GPU % = busiest engine; system GPU % = busiest engine summed
+  over processes (Task Manager's definition). Memory is dedicated/shared bytes.
+  If the counters can't be opened, `SystemTotals::gpu` is `None` and GPU cells stay blank.
 - `src/sampler.rs` — background thread. Computes per-process CPU % (normalized to
   logical cores: `Δcpu / (Δwall × cores) × 100`) and disk B/s from deltas, keyed by
   (PID, start_time) so a reused PID never produces a bogus delta. Publishes
@@ -84,6 +91,9 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
   private; much is likely debug + OpenGL driver. If release is still over 50 MB,
   try the wgpu/DX12 renderer or trimming eframe features.
 - Disk columns come from Windows I/O counters, which include non-disk I/O.
+- GPU tracking was written and cross-checked (`--target x86_64-pc-windows-msvc`) without
+  running on Windows; verify values against Task Manager. Total VRAM isn't shown (needs DXGI).
+  PDH wildcard enumeration of `GPU Engine` can be slow with many processes — watch "sample took".
 - Tree rows show each process's own values, not subtree totals.
 - No confirmation before ending processes (matches Task Manager).
 - Next planned step: a `NtQuerySystemInformation` backend implementing `ProcessSource`.

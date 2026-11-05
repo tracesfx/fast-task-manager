@@ -3,12 +3,16 @@ use std::time::Duration;
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use super::gpu::{GpuCounters, GpuReading};
 use super::{ProcessSource, RawProcess, RawSample};
 
 /// `ProcessSource` backed by the `sysinfo` crate.
 pub struct SysinfoSource {
     sys: System,
     refresh_kind: ProcessRefreshKind,
+    /// `None` if the GPU performance counters can't be opened.
+    gpu: Option<GpuCounters>,
+    gpu_reading: GpuReading,
 }
 
 impl SysinfoSource {
@@ -24,6 +28,8 @@ impl SysinfoSource {
                 .with_disk_usage()
                 // The exe path never changes for a live process; query it once.
                 .with_exe(UpdateKind::OnlyIfNotSet),
+            gpu: GpuCounters::new(),
+            gpu_reading: GpuReading::default(),
         }
     }
 }
@@ -34,10 +40,15 @@ impl ProcessSource for SysinfoSource {
         self.sys.refresh_memory();
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, self.refresh_kind);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.collect(&mut self.gpu_reading);
+        }
+        let gpu_procs = &self.gpu_reading.processes;
 
         out.processes.clear();
         out.processes.extend(self.sys.processes().values().map(|p| {
             let disk = p.disk_usage();
+            let gpu = gpu_procs.get(&p.pid().as_u32()).copied().unwrap_or_default();
             RawProcess {
                 pid: p.pid().as_u32(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
@@ -50,6 +61,9 @@ impl ProcessSource for SysinfoSource {
                 private_bytes: p.virtual_memory(),
                 read_bytes_total: disk.total_read_bytes,
                 write_bytes_total: disk.total_written_bytes,
+                gpu_percent: gpu.percent,
+                gpu_dedicated: gpu.dedicated,
+                gpu_shared: gpu.shared,
                 start_time: p.start_time(),
             }
         }));
@@ -62,5 +76,6 @@ impl ProcessSource for SysinfoSource {
             .extend(self.sys.cpus().iter().map(|c| c.cpu_usage()));
         system.total_memory = self.sys.total_memory();
         system.used_memory = self.sys.used_memory();
+        system.gpu = self.gpu.is_some().then_some(self.gpu_reading.totals);
     }
 }

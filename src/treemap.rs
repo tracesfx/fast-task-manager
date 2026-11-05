@@ -41,16 +41,20 @@ pub enum Metric {
     Memory,
     Cpu,
     Disk,
+    Gpu,
+    GpuMemory,
 }
 
 impl Metric {
-    const ALL: [Metric; 3] = [Metric::Memory, Metric::Cpu, Metric::Disk];
+    const ALL: [Metric; 5] = [Metric::Memory, Metric::Cpu, Metric::Disk, Metric::Gpu, Metric::GpuMemory];
 
     fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
             Self::Cpu => "CPU",
             Self::Disk => "Disk I/O",
+            Self::Gpu => "GPU",
+            Self::GpuMemory => "GPU memory",
         }
     }
 
@@ -59,6 +63,8 @@ impl Metric {
             Self::Memory => s.working_set as f64,
             Self::Cpu => f64::from(s.cpu_percent),
             Self::Disk => (s.disk_read_per_sec + s.disk_write_per_sec) as f64,
+            Self::Gpu => f64::from(s.gpu_percent),
+            Self::GpuMemory => s.gpu_dedicated as f64,
         }
     }
 
@@ -68,6 +74,8 @@ impl Metric {
             Self::Memory => format::mem(s.working_set),
             Self::Cpu => format!("CPU {}%", format::cpu(s.cpu_percent)),
             Self::Disk => format!("Disk {}", format::rate(s.disk_read_per_sec + s.disk_write_per_sec)),
+            Self::Gpu => format!("GPU {}%", format::cpu(s.gpu_percent)),
+            Self::GpuMemory => format!("GPU {}", format::mem(s.gpu_dedicated)),
         }
     }
 
@@ -75,11 +83,10 @@ impl Metric {
     /// the busiest app changes. Ends of the scale are `legend()`.
     fn heat(self, s: &Stats) -> f32 {
         let h = match self {
-            Self::Cpu => (1.0 + f64::from(s.cpu_percent)).ln() / 51f64.ln(),
-            Self::Memory => {
-                let mb = (s.working_set as f64 / (1024.0 * 1024.0)).max(1.0);
-                (mb.log2() - 10f64.log2()) / (4096f64.log2() - 10f64.log2())
-            }
+            Self::Cpu => percent_heat(s.cpu_percent),
+            Self::Gpu => percent_heat(s.gpu_percent),
+            Self::Memory => mem_heat(s.working_set),
+            Self::GpuMemory => mem_heat(s.gpu_dedicated),
             Self::Disk => match self.value(s) {
                 b if b <= 0.0 => 0.0,
                 b => (b.log10() - 3.0) / 5.0,
@@ -90,8 +97,8 @@ impl Metric {
 
     fn legend(self) -> (&'static str, &'static str) {
         match self {
-            Self::Cpu => ("0%", "50%"),
-            Self::Memory => ("10 MB", "4 GB"),
+            Self::Cpu | Self::Gpu => ("0%", "50%"),
+            Self::Memory | Self::GpuMemory => ("10 MB", "4 GB"),
             Self::Disk => ("1 KB/s", "100 MB/s"),
         }
     }
@@ -104,6 +111,9 @@ struct Stats {
     private_bytes: u64,
     disk_read_per_sec: u64,
     disk_write_per_sec: u64,
+    gpu_percent: f32,
+    gpu_dedicated: u64,
+    gpu_shared: u64,
 }
 
 impl Stats {
@@ -113,6 +123,9 @@ impl Stats {
         self.private_bytes += o.private_bytes;
         self.disk_read_per_sec += o.disk_read_per_sec;
         self.disk_write_per_sec += o.disk_write_per_sec;
+        self.gpu_percent += o.gpu_percent;
+        self.gpu_dedicated += o.gpu_dedicated;
+        self.gpu_shared += o.gpu_shared;
     }
 }
 
@@ -124,6 +137,9 @@ impl From<&Metrics<'_>> for Stats {
             private_bytes: m.private_bytes,
             disk_read_per_sec: m.disk_read_per_sec,
             disk_write_per_sec: m.disk_write_per_sec,
+            gpu_percent: m.gpu_percent,
+            gpu_dedicated: m.gpu_dedicated,
+            gpu_shared: m.gpu_shared,
         }
     }
 }
@@ -757,6 +773,17 @@ fn heat_color(heat: f32) -> Color32 {
     Color32::from_rgb(mix(0), mix(1), mix(2))
 }
 
+/// Log scale from 0% to 50%.
+fn percent_heat(percent: f32) -> f64 {
+    (1.0 + f64::from(percent)).ln() / 51f64.ln()
+}
+
+/// Log scale from 10 MB to 4 GB.
+fn mem_heat(bytes: u64) -> f64 {
+    let mb = (bytes as f64 / (1024.0 * 1024.0)).max(1.0);
+    (mb.log2() - 10f64.log2()) / (4096f64.log2() - 10f64.log2())
+}
+
 fn luminance(c: Color32) -> f32 {
     (0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())) / 255.0
 }
@@ -808,6 +835,11 @@ fn tooltip(ui: &mut egui::Ui, tile: &Tile) {
         row("Private", format::mem(s.private_bytes));
         row("Disk read", format::rate(s.disk_read_per_sec));
         row("Disk write", format::rate(s.disk_write_per_sec));
+        row("GPU", format!("{}%", format::cpu(s.gpu_percent)));
+        if s.gpu_dedicated > 0 || s.gpu_shared > 0 {
+            row("GPU dedicated", format::mem(s.gpu_dedicated));
+            row("GPU shared", format::mem(s.gpu_shared));
+        }
     });
     if matches!(tile.key, TileKey::Group(_)) {
         ui.label(RichText::new("Double-click to show its processes").weak().small());

@@ -10,8 +10,14 @@ egui_extras = "0.31"
 # Only the process/CPU/memory module; no rayon thread pool ("multithread"),
 # no disks/networks/components/users.
 sysinfo = { version = "0.34", default-features = false, features = ["system"] }
-# Process actions: end process, set priority. Already in the dependency tree via winit.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# Process actions (end process, set priority) and GPU counters. Already in the
+# dependency tree via winit.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # GPU usage via PDH performance counters.
+    "Win32_System_Performance",
+] }
 
 [profile.release]
 opt-level = 3

@@ -25,13 +25,15 @@ const INDENT: f32 = 16.0;
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_ERROR: Duration = Duration::from_secs(8);
 
-const COLUMNS: [(SortColumn, &str); 10] = [
+const COLUMNS: [(SortColumn, &str); 12] = [
     (SortColumn::Name, "Name"),
     (SortColumn::Pid, "PID"),
     (SortColumn::ParentPid, "PPID"),
     (SortColumn::Cpu, "CPU %"),
+    (SortColumn::Gpu, "GPU %"),
     (SortColumn::WorkingSet, "Working set"),
     (SortColumn::Private, "Private"),
+    (SortColumn::GpuMemory, "GPU memory"),
     (SortColumn::DiskRead, "Disk read"),
     (SortColumn::DiskWrite, "Disk write"),
     (SortColumn::Started, "Running for"),
@@ -219,6 +221,22 @@ impl TaskManagerApp {
                 mem_frac * 100.0
             ));
             ui.separator();
+            match &sys.gpu {
+                Some(gpu) => {
+                    ui.strong(format!("GPU {:.1}%", gpu.percent))
+                        .on_hover_text("Busiest GPU engine, all adapters");
+                    ui.label(format!(
+                        "GPU mem {} dedicated / {} shared",
+                        format::bytes(gpu.dedicated),
+                        format::bytes(gpu.shared)
+                    ));
+                }
+                None => {
+                    ui.label("GPU n/a")
+                        .on_hover_text("GPU performance counters are unavailable (needs a WDDM 2.0+ driver)");
+                }
+            }
+            ui.separator();
             ui.label(format!("{} processes", snap.processes.len()));
             ui.separator();
             ui.label(format!(
@@ -316,11 +334,8 @@ impl TaskManagerApp {
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::initial(260.0).at_least(80.0).clip(true))
-            .column(Column::initial(60.0).at_least(40.0))
-            .column(Column::initial(60.0).at_least(40.0))
-            .column(Column::initial(60.0).at_least(40.0))
-            .columns(Column::initial(90.0).at_least(50.0), 4)
-            .column(Column::initial(90.0).at_least(50.0))
+            .columns(Column::initial(60.0).at_least(40.0), 4)
+            .columns(Column::initial(90.0).at_least(50.0), 6)
             .column(Column::remainder().at_least(80.0).clip(true))
             .header(row_height + 2.0, |mut header| {
                 for (column, label) in COLUMNS {
@@ -368,6 +383,7 @@ impl TaskManagerApp {
             RowKind::Process(i) => (Metrics::of(&procs[i]), 1),
         };
         let is_aggregate = count > 1;
+        let has_gpu = self.snapshot.system.gpu.is_some();
 
         table_row.col(|ui| {
             ui.add_space(f32::from(row.depth) * INDENT);
@@ -402,8 +418,21 @@ impl TaskManagerApp {
             }
         });
         table_row.col(|ui| right(ui, format::cpu(m.cpu_percent)));
+        table_row.col(|ui| {
+            if has_gpu {
+                right(ui, format::cpu(m.gpu_percent));
+            }
+        });
         table_row.col(|ui| right(ui, format::mem(m.working_set)));
         table_row.col(|ui| right(ui, format::mem(m.private_bytes)));
+        table_row.col(|ui| {
+            if has_gpu {
+                let cell = right_label(ui, format::mem(m.gpu_dedicated));
+                if m.gpu_shared > 0 {
+                    cell.on_hover_text(format!("Shared GPU memory: {}", format::mem(m.gpu_shared)));
+                }
+            }
+        });
         table_row.col(|ui| right(ui, format::rate(m.disk_read_per_sec)));
         table_row.col(|ui| right(ui, format::rate(m.disk_write_per_sec)));
         table_row.col(|ui| {
@@ -596,9 +625,12 @@ impl eframe::App for TaskManagerApp {
 }
 
 fn right(ui: &mut egui::Ui, text: String) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(text);
-    });
+    right_label(ui, text);
+}
+
+fn right_label(ui: &mut egui::Ui, text: String) -> egui::Response {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(text))
+        .inner
 }
 
 fn interval_label(ms: u64) -> String {
