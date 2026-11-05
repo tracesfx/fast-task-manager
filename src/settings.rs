@@ -434,9 +434,12 @@ mod tests {
         let order: Vec<TableColumn> = s.columns.iter().map(|c| c.column).collect();
         assert_eq!(order.len(), TableColumn::ALL.len());
         // Missing columns go after their predecessor in `TableColumn::ALL`.
-        assert_eq!(&order[..4], [TableColumn::Cpu, TableColumn::CpuHistory, TableColumn::Gpu, TableColumn::Name]);
-        assert_eq!(order[4], TableColumn::Pid);
-        assert!(s.columns[3].visible, "Name is always visible");
+        use TableColumn::*;
+        assert_eq!(
+            order,
+            [Cpu, CpuHistory, Gpu, WorkingSet, Private, GpuMemory, DiskRead, DiskWrite, Started, Path, Name, Pid, ParentPid]
+        );
+        assert!(s.columns[10].visible, "Name is always visible");
     }
 
     /// Settings saved by v0.1.0 (no GPU columns) keep their order and
