@@ -9,11 +9,16 @@
 //! `SysinfoSource` (feature `sysinfo`) is the previous backend, kept to
 //! compare against: `FTM_SOURCE=sysinfo` selects it at runtime, and the tests
 //! below check the two agree and benchmark them.
+//!
+//! `WithGpu` wraps either backend and adds GPU usage from performance
+//! counters. Like system CPU %, GPU % arrives pre-computed (see `gpu`).
 
+mod gpu;
 mod nt_source;
 #[cfg(feature = "sysinfo")]
 mod sysinfo_source;
 
+pub use gpu::WithGpu;
 pub use nt_source::NtSource;
 #[cfg(feature = "sysinfo")]
 pub use sysinfo_source::SysinfoSource;
@@ -40,6 +45,11 @@ pub struct RawProcess {
     pub read_bytes_total: u64,
     /// Total bytes written since the process started.
     pub write_bytes_total: u64,
+    /// Busiest GPU engine, 0..=100, pre-computed; filled in by `WithGpu`.
+    pub gpu_percent: f32,
+    /// Dedicated / shared GPU memory committed, bytes (current, not cumulative).
+    pub gpu_dedicated: u64,
+    pub gpu_shared: u64,
     /// Seconds since the Unix epoch; 0 if unknown.
     pub start_time: u64,
 }
@@ -48,7 +58,8 @@ pub struct RawProcess {
 pub struct RawSample {
     pub processes: Vec<RawProcess>,
     /// System totals are already percentages; a backend that reads raw
-    /// per-core idle/busy times computes them internally.
+    /// per-core idle/busy times computes them internally. `system.gpu` is
+    /// set only by `WithGpu`.
     pub system: SystemTotals,
 }
 

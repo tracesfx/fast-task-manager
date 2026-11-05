@@ -26,7 +26,7 @@ use crate::layout::{self, Pane, Preset};
 use crate::model::Snapshot;
 use crate::sampler::SamplerHandle;
 use crate::settings::{self, Appearance, Settings, TableColumn};
-use crate::source::NtSource;
+use crate::source::{NtSource, WithGpu};
 use crate::treemap::{Metric, Treemap};
 use crate::view::{Metrics, ProcKey, Row, RowId, RowKind, Sort, SortColumn, View, ViewMode, ViewState};
 
@@ -413,7 +413,7 @@ impl TaskManagerApp {
         let sys = &snap.system;
 
         ui.horizontal(|ui| {
-            graphs::totals(ui, history, sys.total_memory);
+            graphs::totals(ui, history, sys.total_memory, sys.gpu);
             ui.separator();
             ui.label(format!("{} processes", snap.processes.len()));
             ui.separator();
@@ -486,6 +486,13 @@ impl TaskManagerApp {
                 format::bytes(sys.total_memory)
             )),
         );
+        if let Some(gpu) = sys.gpu {
+            ui.add(egui::ProgressBar::new(gpu.percent / 100.0).text(format!(
+                "GPU {:.1}% · {} dedicated",
+                gpu.percent,
+                format::bytes(gpu.dedicated)
+            )));
+        }
         let Some(last) = history.system().back() else {
             return;
         };
@@ -643,6 +650,7 @@ impl TaskManagerApp {
             RowKind::Process(i) => (Metrics::of(&procs[i]), 1),
         };
         let is_aggregate = count > 1;
+        let has_gpu = self.snapshot.system.gpu.is_some();
 
         for &column in columns {
             table_row.col(|ui| match column {
@@ -687,8 +695,19 @@ impl TaskManagerApp {
                         }
                     }
                 }
+                TableColumn::Gpu => {
+                    if has_gpu {
+                        right(ui, format::cpu(m.gpu_percent));
+                    }
+                }
                 TableColumn::WorkingSet => right(ui, format::mem(m.working_set)),
                 TableColumn::Private => right(ui, format::mem(m.private_bytes)),
+                TableColumn::GpuMemory => {
+                    // Dedicated; shared GPU memory is in the treemap tooltip.
+                    if has_gpu {
+                        right(ui, format::mem(m.gpu_dedicated));
+                    }
+                }
                 TableColumn::DiskRead => right(ui, format::rate(m.disk_read_per_sec)),
                 TableColumn::DiskWrite => right(ui, format::rate(m.disk_write_per_sec)),
                 TableColumn::Started => {
@@ -1064,16 +1083,16 @@ fn spawn_sampler(interval: Duration, ctx: egui::Context) -> SamplerHandle {
     let notify = move || ctx.request_repaint();
     #[cfg(feature = "sysinfo")]
     if std::env::var_os("FTM_SOURCE").is_some_and(|v| v == "sysinfo") {
-        return SamplerHandle::spawn(crate::source::SysinfoSource::new(), interval, notify);
+        return SamplerHandle::spawn(WithGpu::new(crate::source::SysinfoSource::new()), interval, notify);
     }
-    SamplerHandle::spawn(NtSource::new(), interval, notify)
+    SamplerHandle::spawn(WithGpu::new(NtSource::new()), interval, notify)
 }
 
 /// Width rules of a table column; the last one takes the remaining width.
 fn column_spec(column: TableColumn, last: bool) -> Column {
     let (initial, min) = match column {
         TableColumn::Name => (260.0, 80.0),
-        TableColumn::Pid | TableColumn::ParentPid | TableColumn::Cpu => (60.0, 40.0),
+        TableColumn::Pid | TableColumn::ParentPid | TableColumn::Cpu | TableColumn::Gpu => (60.0, 40.0),
         TableColumn::CpuHistory => (SPARKLINE_WIDTH, 40.0),
         TableColumn::Path => (300.0, 80.0),
         _ => (90.0, 50.0),

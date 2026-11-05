@@ -1,6 +1,6 @@
 [package]
 name = "fast-task-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A fast, lightweight task manager for Windows"
 
@@ -23,6 +23,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # GPU usage (PDH performance counters).
+    "Win32_System_Performance",
     "Win32_System_WindowsProgramming",
     # Global show/hide hotkey.
     "Win32_UI_Input_KeyboardAndMouse",

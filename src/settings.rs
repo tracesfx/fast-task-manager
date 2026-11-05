@@ -38,8 +38,10 @@ pub enum TableColumn {
     Cpu,
     /// CPU sparkline; only shown in Apps mode.
     CpuHistory,
+    Gpu,
     WorkingSet,
     Private,
+    GpuMemory,
     DiskRead,
     DiskWrite,
     Started,
@@ -47,14 +49,16 @@ pub enum TableColumn {
 }
 
 impl TableColumn {
-    pub const ALL: [TableColumn; 11] = [
+    pub const ALL: [TableColumn; 13] = [
         Self::Name,
         Self::Pid,
         Self::ParentPid,
         Self::Cpu,
         Self::CpuHistory,
+        Self::Gpu,
         Self::WorkingSet,
         Self::Private,
+        Self::GpuMemory,
         Self::DiskRead,
         Self::DiskWrite,
         Self::Started,
@@ -68,6 +72,8 @@ impl TableColumn {
             Self::ParentPid => "PPID",
             Self::Cpu => "CPU %",
             Self::CpuHistory => "CPU history",
+            Self::Gpu => "GPU %",
+            Self::GpuMemory => "GPU memory",
             Self::WorkingSet => "Working set",
             Self::Private => "Private",
             Self::DiskRead => "Disk read",
@@ -84,6 +90,8 @@ impl TableColumn {
             Self::ParentPid => SortColumn::ParentPid,
             Self::Cpu => SortColumn::Cpu,
             Self::CpuHistory => return None,
+            Self::Gpu => SortColumn::Gpu,
+            Self::GpuMemory => SortColumn::GpuMemory,
             Self::WorkingSet => SortColumn::WorkingSet,
             Self::Private => SortColumn::Private,
             Self::DiskRead => SortColumn::DiskRead,
@@ -213,9 +221,15 @@ impl Settings {
             seen.push(c.column);
             new
         });
-        for column in TableColumn::ALL {
+        for (i, &column) in TableColumn::ALL.iter().enumerate() {
             if !seen.contains(&column) {
-                self.columns.push(ColumnSetting { column, visible: true });
+                // Right after the nearest earlier column that is present.
+                let at = TableColumn::ALL[..i]
+                    .iter()
+                    .rev()
+                    .find_map(|prev| self.columns.iter().position(|c| c.column == *prev))
+                    .map_or(0, |p| p + 1);
+                self.columns.insert(at, ColumnSetting { column, visible: true });
             }
         }
         for c in &mut self.columns {
@@ -419,7 +433,32 @@ mod tests {
         assert_eq!(s.gradient, DEFAULT_GRADIENT.to_vec());
         let order: Vec<TableColumn> = s.columns.iter().map(|c| c.column).collect();
         assert_eq!(order.len(), TableColumn::ALL.len());
-        assert_eq!(&order[..3], [TableColumn::Cpu, TableColumn::Name, TableColumn::Pid]);
-        assert!(s.columns[1].visible, "Name is always visible");
+        // Missing columns go after their predecessor in `TableColumn::ALL`.
+        assert_eq!(&order[..4], [TableColumn::Cpu, TableColumn::CpuHistory, TableColumn::Gpu, TableColumn::Name]);
+        assert_eq!(order[4], TableColumn::Pid);
+        assert!(s.columns[3].visible, "Name is always visible");
+    }
+
+    /// Settings saved by v0.1.0 (no GPU columns) keep their order and
+    /// visibility; the GPU columns appear next to CPU and memory.
+    #[test]
+    fn normalize_adds_gpu_columns_to_old_settings() {
+        use TableColumn::*;
+        let old = [Name, Cpu, CpuHistory, WorkingSet, Private, DiskRead, DiskWrite, Pid, ParentPid, Started, Path];
+        let mut s = Settings {
+            columns: old
+                .iter()
+                .map(|&column| ColumnSetting { column, visible: column != Pid })
+                .collect(),
+            ..Settings::default()
+        };
+        s.normalize();
+        let order: Vec<TableColumn> = s.columns.iter().map(|c| c.column).collect();
+        assert_eq!(
+            order,
+            [Name, Cpu, CpuHistory, Gpu, WorkingSet, Private, GpuMemory, DiskRead, DiskWrite, Pid, ParentPid, Started, Path]
+        );
+        assert!(!s.columns[9].visible, "hidden columns stay hidden");
+        assert!(s.columns[3].visible && s.columns[6].visible);
     }
 }

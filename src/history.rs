@@ -38,6 +38,8 @@ pub struct SystemPoint {
     pub used_memory: u64,
     pub disk_read_per_sec: u64,
     pub disk_write_per_sec: u64,
+    /// 0 when GPU counters are unavailable (`SystemTotals::gpu` is `None`).
+    pub gpu_percent: f32,
     /// Busiest app groups at this moment, busiest first.
     pub top: Box<[TopApp]>,
 }
@@ -76,6 +78,7 @@ pub struct Sample {
     used_memory: u64,
     disk_read_per_sec: u64,
     disk_write_per_sec: u64,
+    gpu_percent: f32,
     /// (group key, display name, point), in no particular order.
     groups: Vec<(Arc<str>, Arc<str>, GroupPoint)>,
 }
@@ -101,6 +104,7 @@ impl Sample {
             used_memory: snap.system.used_memory,
             disk_read_per_sec: read,
             disk_write_per_sec: write,
+            gpu_percent: snap.system.gpu.map_or(0.0, |g| g.percent),
             groups: groups
                 .into_iter()
                 .map(|(key, name, cpu, mem)| {
@@ -201,6 +205,7 @@ impl History {
             used_memory: sample.used_memory,
             disk_read_per_sec: sample.disk_read_per_sec,
             disk_write_per_sec: sample.disk_write_per_sec,
+            gpu_percent: sample.gpu_percent,
             top: top
                 .into_iter()
                 .filter_map(|(_, name, cpu_percent)| Some(TopApp { name: name?, cpu_percent }))
@@ -256,6 +261,9 @@ mod tests {
             private_bytes: 0,
             disk_read_per_sec: 10,
             disk_write_per_sec: 5,
+            gpu_percent: 0.0,
+            gpu_dedicated: 0,
+            gpu_shared: 0,
             start_time: 1,
         }
     }

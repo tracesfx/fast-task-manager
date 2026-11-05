@@ -53,6 +53,9 @@ impl ProcessSource for SysinfoSource {
                 private_bytes: p.virtual_memory(),
                 read_bytes_total: disk.total_read_bytes,
                 write_bytes_total: disk.total_written_bytes,
+                gpu_percent: 0.0,
+                gpu_dedicated: 0,
+                gpu_shared: 0,
                 start_time: p.start_time(),
             }
         }));

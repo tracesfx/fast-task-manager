@@ -51,6 +51,14 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
   as `Arc<str>`/`Arc<Path>`, keyed by (PID, creation time). PID 0 reports no CPU time.
   Per-core times come from `SystemProcessorPerformanceInformation` (one processor group,
   ≤ 64 cores). Debug benchmark: NT ~4.4 ms/sample vs sysinfo 24–62 ms (~455 processes).
+- `src/source/gpu.rs` — `WithGpu<S>` wraps either backend and fills GPU fields by PID
+  from PDH performance counters (`GPU Engine`, `GPU Process Memory`, `GPU Adapter
+  Memory`; English names via `PdhAddEnglishCounterW`). Pre-computed like system CPU %:
+  PDH formats engine `Utilization Percentage` over the time between collects.
+  Per-process GPU % = busiest engine; system GPU % = busiest engine summed over
+  processes (Task Manager's definition). Memory is dedicated/shared bytes. If the
+  counters can't be opened, `SystemTotals::gpu` is `None`: GPU cells stay blank and
+  the GPU graphs are hidden.
 - `src/sampler.rs` — background thread. Computes per-process CPU % (normalized to
   logical cores: `Δcpu / (Δwall × cores) × 100`) and disk B/s from deltas, keyed by
   (PID, start_time) so a reused PID never produces a bogus delta. Computes each process's
@@ -77,7 +85,7 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
   (`explorer /select,"..."` via `raw_arg`). Each request runs on its own thread and
   returns an `Outcome` shown as a toast.
 - `src/treemap.rs` — live treemap (a dock pane). Own squarified layout over app groups (`ViewState::app_groups`,
-  filter-aware, any mode); size/color metric selectable (Memory/CPU/Disk I/O); color
+  filter-aware, any mode); size/color metric selectable (Memory/CPU/Disk I/O/GPU/GPU memory); color
   is a fixed log scale (not relative to the max) through a configurable gradient. Tiles below `MIN_TILE_AREA` px² go
   into "Other" (with hysteresis). Layout order is stable: previous order, and a tile
   only overtakes its predecessor when `REORDER_RATIO`× bigger. A transition runs only
@@ -96,7 +104,8 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
   App details, Top apps/mini) and layout presets (Default/Visual/Detailed/Compact).
   Each pane is in the dock at most once; View menu closes/reopens them.
 - `src/settings.rs` — `Settings` (interval, theme/accent/text size, UI scale = egui
-  zoom, treemap gradient + default metrics, column order/visibility, totals bar,
+  zoom, treemap gradient + default metrics, column order/visibility (columns added in a
+  newer version are inserted after their predecessor in `TableColumn::ALL`), totals bar,
   always-on-top, hotkey) and the Settings window. `normalize()` repairs loaded values.
 - `src/hotkey.rs` — global Ctrl+Alt+T show/hide: `RegisterHotKey` on its own thread
   with a `GetMessageW` loop; shows/hides via Win32 `ShowWindow` (a window hidden
@@ -161,5 +170,12 @@ Goals: idle under ~1% CPU and ~50 MB RAM; the UI never blocks on polling.
 - AccessKit is active on this machine (some UI Automation client), costing ~0.3 ms per
   frame plus node building.
 - Disk columns come from Windows I/O counters, which include non-disk I/O.
+- GPU tracking (v0.2.0) was cross-checked with clippy for `x86_64-pc-windows-msvc` and CI,
+  but not compared against Task Manager yet. Total VRAM isn't shown (needs DXGI). PDH
+  wildcard enumeration of `GPU Engine` can be slow with many processes — watch "sample
+  took" (the `gpu counters` profile scope).
+- Releases: push a `vX.Y.Z` tag matching `Cargo.toml`; `.github/workflows/release.yml`
+  builds the Inno Setup installer. Keep the `AppId` in `installer/fast-task-manager.iss`
+  unchanged so a new setup upgrades the existing install in place.
 - Tree rows show each process's own values, not subtree totals.
 - No confirmation before ending processes (matches Task Manager).

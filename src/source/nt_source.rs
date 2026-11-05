@@ -204,6 +204,9 @@ fn read_processes(
             private_bytes: entry.PagefileUsage as u64,
             read_bytes_total: e.read_bytes(),
             write_bytes_total: e.write_bytes(),
+            gpu_percent: 0.0,
+            gpu_dedicated: 0,
+            gpu_shared: 0,
             start_time: (created / TICKS_PER_SEC).saturating_sub(EPOCH_DIFF_SECS),
         });
 

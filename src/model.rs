@@ -21,6 +21,12 @@ pub struct ProcessInfo {
     pub private_bytes: u64,
     pub disk_read_per_sec: u64,
     pub disk_write_per_sec: u64,
+    /// Busiest GPU engine used by this process, 0..=100.
+    pub gpu_percent: f32,
+    /// Dedicated (on-board) GPU memory committed by this process.
+    pub gpu_dedicated: u64,
+    /// Shared (system RAM) GPU memory committed by this process.
+    pub gpu_shared: u64,
     /// Seconds since the Unix epoch; 0 if unknown (e.g. Idle / System).
     pub start_time: u64,
 }
@@ -31,6 +37,18 @@ pub struct SystemTotals {
     pub per_core_percent: Vec<f32>,
     pub total_memory: u64,
     pub used_memory: u64,
+    /// `None` when the GPU performance counters aren't available.
+    pub gpu: Option<GpuTotals>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTotals {
+    /// Busiest engine across all adapters, summed over processes, 0..=100.
+    pub percent: f32,
+    /// Dedicated GPU memory in use, all adapters.
+    pub dedicated: u64,
+    /// Shared GPU memory in use, all adapters.
+    pub shared: u64,
 }
 
 /// A complete, immutable view of the system at one point in time.

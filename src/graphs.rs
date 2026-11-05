@@ -11,11 +11,12 @@ use egui_plot::{Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points, VLine};
 
 use crate::format;
 use crate::history::{GroupHistory, History, SystemPoint, WINDOW};
-use crate::model::SystemTotals;
+use crate::model::{GpuTotals, SystemTotals};
 
 pub const CPU_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
 pub const MEM_COLOR: Color32 = Color32::from_rgb(180, 120, 255);
 pub const DISK_COLOR: Color32 = Color32::from_rgb(90, 200, 120);
+pub const GPU_COLOR: Color32 = Color32::from_rgb(240, 160, 60);
 
 const SMALL: Vec2 = vec2(200.0, 44.0);
 const MIB: f64 = 1024.0 * 1024.0;
@@ -107,8 +108,9 @@ fn system_series(h: &History, value: impl Fn(&SystemPoint) -> f64) -> Vec<PlotPo
     h.system().iter().map(|p| PlotPoint::new(p.t - now, value(p))).collect()
 }
 
-/// The three small graphs of the top bar: total CPU, RAM and disk I/O.
-pub fn totals(ui: &mut egui::Ui, h: &History, total_memory: u64) {
+/// The small graphs of the top bar: total CPU, RAM, disk I/O and (when the
+/// counters are available) GPU.
+pub fn totals(ui: &mut egui::Ui, h: &History, total_memory: u64, gpu: Option<GpuTotals>) {
     profile_scope!("totals graphs");
     let Some(last) = h.system().back() else {
         return;
@@ -156,10 +158,30 @@ pub fn totals(ui: &mut egui::Ui, h: &History, total_memory: u64) {
             format::rate(p.disk_write_per_sec)
         ));
     }
+
+    if let Some(gpu) = gpu {
+        let points = system_series(h, |p| f64::from(p.gpu_percent));
+        let (response, hovered) = plot(ui, "total_gpu", &points, 100.0, GPU_COLOR, SMALL, None);
+        caption(ui, response.rect, format!("GPU {:.1}%", last.gpu_percent));
+        let memory = gpu_memory(gpu);
+        match hovered.and_then(|i| h.system().get(i)) {
+            Some(p) => response.on_hover_text_at_pointer(format!("{}\nGPU {:.1}%\n{memory}", ago(now - p.t), p.gpu_percent)),
+            None => response.on_hover_text(memory),
+        };
+    }
 }
 
-/// The Performance pane: CPU, RAM and disk I/O graphs sharing the height,
-/// then the load of each logical core.
+/// "GPU memory 1.2 GB dedicated · 300 MB shared".
+fn gpu_memory(gpu: GpuTotals) -> String {
+    format!(
+        "GPU memory {} dedicated · {} shared",
+        format::bytes(gpu.dedicated),
+        format::bytes(gpu.shared)
+    )
+}
+
+/// The Performance pane: CPU, RAM, disk I/O and (if available) GPU graphs
+/// sharing the height, then the load of each logical core.
 pub fn system(ui: &mut egui::Ui, h: &History, sys: &SystemTotals) {
     let Some(last) = h.system().back() else {
         ui.weak("No samples yet");
@@ -173,8 +195,9 @@ pub fn system(ui: &mut egui::Ui, h: &History, sys: &SystemTotals) {
     let core_rows = sys.per_core_percent.len().div_ceil(per_row) as f32;
     let cores_height = core_rows * (ui.spacing().interact_size.y + spacing.y);
     let label_height = ui.text_style_height(&egui::TextStyle::Body) + spacing.y;
-    let free = ui.available_height() - cores_height - 3.0 * (label_height + spacing.y) - 8.0;
-    let size = vec2(width, (free / 3.0).max(50.0));
+    let graphs = if sys.gpu.is_some() { 4.0 } else { 3.0 };
+    let free = ui.available_height() - cores_height - graphs * (label_height + spacing.y) - 8.0;
+    let size = vec2(width, (free / graphs).max(50.0));
 
     ui.strong(format!("CPU {:.1}%", last.cpu_percent));
     let points = system_series(h, |p| f64::from(p.cpu_percent));
@@ -214,6 +237,18 @@ Write {}",
             format::rate(p.disk_read_per_sec),
             format::rate(p.disk_write_per_sec)
         ));
+    }
+
+    if let Some(gpu) = sys.gpu {
+        ui.strong(format!("GPU {:.1}%", last.gpu_percent))
+            .on_hover_text("Busiest GPU engine, all adapters (as in Task Manager)");
+        let points = system_series(h, |p| f64::from(p.gpu_percent));
+        let (response, hovered) = plot(ui, "perf_gpu", &points, 100.0, GPU_COLOR, size, Some(|v| format!("{v:.0}%")));
+        let memory = gpu_memory(gpu);
+        match hovered.and_then(|i| h.system().get(i)) {
+            Some(p) => response.on_hover_text_at_pointer(format!("{}\nGPU {:.1}%\n{memory}", ago(now - p.t), p.gpu_percent)),
+            None => response.on_hover_text(memory),
+        };
     }
 
     ui.add_space(4.0);

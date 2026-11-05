@@ -220,6 +220,9 @@ impl<S: ProcessSource> Sampler<S> {
                 private_bytes: p.private_bytes,
                 disk_read_per_sec: read_rate,
                 disk_write_per_sec: write_rate,
+                gpu_percent: p.gpu_percent,
+                gpu_dedicated: p.gpu_dedicated,
+                gpu_shared: p.gpu_shared,
                 start_time: p.start_time,
             });
         }

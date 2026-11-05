@@ -58,8 +58,10 @@ pub enum SortColumn {
     ParentPid,
     Name,
     Cpu,
+    Gpu,
     WorkingSet,
     Private,
+    GpuMemory,
     DiskRead,
     DiskWrite,
     Started,
@@ -71,7 +73,13 @@ impl SortColumn {
     pub fn default_descending(self) -> bool {
         matches!(
             self,
-            Self::Cpu | Self::WorkingSet | Self::Private | Self::DiskRead | Self::DiskWrite
+            Self::Cpu
+                | Self::Gpu
+                | Self::WorkingSet
+                | Self::Private
+                | Self::GpuMemory
+                | Self::DiskRead
+                | Self::DiskWrite
         )
     }
 
@@ -81,9 +89,13 @@ impl SortColumn {
             Self::ParentPid => a.parent_pid.cmp(&b.parent_pid),
             Self::Name => cmp_ignore_ascii_case(a.name, b.name),
             Self::Cpu => format::cpu_key(a.cpu_percent).cmp(&format::cpu_key(b.cpu_percent)),
+            Self::Gpu => format::cpu_key(a.gpu_percent).cmp(&format::cpu_key(b.gpu_percent)),
             Self::WorkingSet => format::mem_key(a.working_set).cmp(&format::mem_key(b.working_set)),
             Self::Private => {
                 format::mem_key(a.private_bytes).cmp(&format::mem_key(b.private_bytes))
+            }
+            Self::GpuMemory => {
+                format::mem_key(a.gpu_dedicated).cmp(&format::mem_key(b.gpu_dedicated))
             }
             Self::DiskRead => {
                 format::rate_key(a.disk_read_per_sec).cmp(&format::rate_key(b.disk_read_per_sec))
@@ -125,6 +137,9 @@ pub struct Metrics<'a> {
     pub private_bytes: u64,
     pub disk_read_per_sec: u64,
     pub disk_write_per_sec: u64,
+    pub gpu_percent: f32,
+    pub gpu_dedicated: u64,
+    pub gpu_shared: u64,
     pub start_time: u64,
 }
 
@@ -140,6 +155,9 @@ impl<'a> Metrics<'a> {
             private_bytes: p.private_bytes,
             disk_read_per_sec: p.disk_read_per_sec,
             disk_write_per_sec: p.disk_write_per_sec,
+            gpu_percent: p.gpu_percent,
+            gpu_dedicated: p.gpu_dedicated,
+            gpu_shared: p.gpu_shared,
             start_time: p.start_time,
         }
     }
@@ -156,6 +174,9 @@ pub struct Group {
     private_bytes: u64,
     disk_read_per_sec: u64,
     disk_write_per_sec: u64,
+    gpu_percent: f32,
+    gpu_dedicated: u64,
+    gpu_shared: u64,
     /// Earliest known start time of any member (0 = unknown).
     start_time: u64,
 }
@@ -171,6 +192,9 @@ impl Group {
             private_bytes: 0,
             disk_read_per_sec: 0,
             disk_write_per_sec: 0,
+            gpu_percent: 0.0,
+            gpu_dedicated: 0,
+            gpu_shared: 0,
             start_time: 0,
         }
     }
@@ -183,6 +207,9 @@ impl Group {
         self.private_bytes += p.private_bytes;
         self.disk_read_per_sec += p.disk_read_per_sec;
         self.disk_write_per_sec += p.disk_write_per_sec;
+        self.gpu_percent += p.gpu_percent;
+        self.gpu_dedicated += p.gpu_dedicated;
+        self.gpu_shared += p.gpu_shared;
         if p.start_time != 0 && (self.start_time == 0 || p.start_time < self.start_time) {
             self.start_time = p.start_time;
         }
@@ -201,6 +228,9 @@ impl Group {
             private_bytes: self.private_bytes,
             disk_read_per_sec: self.disk_read_per_sec,
             disk_write_per_sec: self.disk_write_per_sec,
+            gpu_percent: self.gpu_percent.min(100.0),
+            gpu_dedicated: self.gpu_dedicated,
+            gpu_shared: self.gpu_shared,
             start_time: self.start_time,
         }
     }
@@ -688,6 +718,9 @@ mod tests {
             private_bytes: 0,
             disk_read_per_sec: 0,
             disk_write_per_sec: 0,
+            gpu_percent: 0.0,
+            gpu_dedicated: 0,
+            gpu_shared: 0,
             start_time: start,
         }
     }
